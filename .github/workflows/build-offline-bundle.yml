@@ -73,7 +73,7 @@ jobs:
           python3 build/check_undefined.py \
               build/build_bundle.py build/test_native_mode.py \
               build/check_undefined.py build/gh_run.py build/test_workflow.py \
-              build/push_api.py build/test_push_api.py
+              build/push_api.py build/test_push_api.py build/test_download.py
           echo ""
           echo "── 原生模式参数不变量（锁死 pip 调用参数）──"
           python3 build/test_native_mode.py
@@ -83,6 +83,9 @@ jobs:
           echo ""
           echo "── 推送工具自测（blob 批量解析逐字节校验）──"
           python3 build/test_push_api.py
+          echo ""
+          echo "── 下载器自测（多分片并发 / 续传 / 拼接）──"
+          python3 build/test_download.py
           echo ""
           echo "── shell 语法 ──"
           bash -n build/ci-entry.sh

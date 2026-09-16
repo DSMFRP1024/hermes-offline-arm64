@@ -640,10 +640,21 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     if not made:
         raise SystemExit("没有产出任何 node_modules，Node 依赖安装可能整体失败了")
 
-    # node-pty 是唯一的强制原生模块，缺了就说明预构建没成功
-    if not list((repo / "node_modules").glob("node-pty/build/Release/*.node")) \
-       and not list((repo / "ui-tui/node_modules").glob("node-pty/build/Release/*.node")):
-        LOG("  ⚠ 没找到 node-pty 的原生 .node 产物，PTY 功能在目标机上可能不可用")
+    # node-pty 属于 apps/desktop，而 apps/* 是被刻意排除的（见上面 docstring），
+    # 所以正常构建本来就**不该**出现它 —— 早先这里直接检查"有没有 .node"，
+    # 结果是每轮构建都必然打一条"PTY 可能不可用"的警告，把"不在安装范围"
+    # 误报成"构建失败"。真正该报警的是相反情形：它被拉进来了、却没编出来。
+    nm_dirs = [repo / "node_modules", repo / "ui-tui/node_modules",
+               repo / "web/node_modules"]
+    present = [d for d in nm_dirs if (d / "node-pty").is_dir()]
+    if not present:
+        LOG("  · 未包含 node-pty（它在 apps/desktop 里，CLI 链路用不到，属预期）")
+    # 注意要 any(list(...)) 而不是 any(gen for ...)：后者里每个元素是**生成器
+    # 对象**，bool(生成器) 恒为真，条件会永远成立。
+    elif any(list((d / "node-pty/build/Release").glob("*.node")) for d in present):
+        LOG("  ✓ node-pty 原生模块已就绪")
+    else:
+        LOG("  ⚠ 拉进了 node-pty 却没编出 .node —— 终端模拟功能会在目标机不可用")
     LOG(f"  （已清理 {n_removed} 个非 linux-arm64 平台包）")
     LOG()
 

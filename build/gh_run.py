@@ -8,7 +8,9 @@
     它就会无限挂起，连 Ctrl-C 都要等很久才响应。这里自己实现：
 
      - 每次读操作都有 socket 超时（默认 60s），卡住就报错而不是干等；
-     - 断点续传（`<file>.part` + `Range:` 头），断开后重跑不从头开始；
+     - **多分片并发**：跨境链路单连接常被限速在几百 KiB/s，692 MiB 的包
+       单连接要跑近一小时；切成 4 片并发能把总吞吐拉到接近 4 倍；
+     - 断点续传（`<file>.partN` + `Range:` 头），断开后重跑不从头开始；
      - 下载完拿 API 返回的 `digest`（sha256）做完整性校验；
      - 从 artifact zip 里取出内层 tar.gz，再算一遍 sha256 作为最终凭据。
 
@@ -16,7 +18,7 @@
     python gh_run.py runs     --repo OWNER/REPO
     python gh_run.py watch    --repo OWNER/REPO --run RUN_ID
     python gh_run.py arts     --repo OWNER/REPO --run RUN_ID
-    python gh_run.py download --repo OWNER/REPO --artifact ART_ID --out DIR
+    python gh_run.py download --repo OWNER/REPO --artifact ART_ID --out DIR [--parts 8]
     python gh_run.py verify   --tarball dist/hermes-offline-arm64.tar.gz
 
 代理：自动读 HTTP_PROXY / HTTPS_PROXY 环境变量。
@@ -34,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -193,84 +196,233 @@ def cmd_arts(args) -> int:
     return 0
 
 
-# ───────────────────────────── 下载（超时 + 断点续传） ─────────────────────────────
+# ──────────────────── 下载（多分片并发 + 超时 + 断点续传） ────────────────────
+#
+# 为什么必须并发分片：
+#   跨境链路上单条 TCP 连接的吞吐常被压在几百 KiB/s，而这个 artifact
+#   有 692 MiB —— 单连接实测只有 ~200–350 KiB/s，要跑 50 分钟左右。
+#   切成 N 个区间并发拉，总吞吐能接近 N 倍（瓶颈从"单连接"变成"总带宽"）。
 
-def download_file(url: str, dest: Path, token: str, timeout: float,
-                  retries: int = 5) -> None:
-    """带断点续传的分片下载。任何一次读卡住超过 timeout 秒就抛错重试。"""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    part = dest.with_suffix(dest.suffix + ".part")
-    total = None
+
+class _Progress:
+    """多线程共享的字节计数。"""
+
+    def __init__(self, initial: int = 0):
+        self._lock = threading.Lock()
+        self._done = initial
+
+    def add(self, n: int) -> None:
+        with self._lock:
+            self._done += n
+
+    def get(self) -> int:
+        with self._lock:
+            return self._done
+
+
+def probe_total(url: str, token: str, timeout: float) -> tuple[int | None, bool]:
+    """探测 (总字节数, 是否支持 Range)。只取 1 字节，不拉整个文件。"""
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": UA,
+        "Range": "bytes=0-0",
+    })
+    with _opener().open(req, timeout=timeout) as r:
+        cr = r.headers.get("Content-Range")
+        r.read(1)
+        if r.status == 206 and cr and "/" in cr:
+            return int(cr.rsplit("/", 1)[-1]), True
+        cl = r.headers.get("Content-Length")
+        return (int(cl) if cl else None), False
+
+
+def _fetch_range(url: str, token: str, path: Path, start: int, end: int,
+                 timeout: float, retries: int, prog: _Progress, label: int) -> None:
+    """把 [start, end] 区间下到 path，区间内可断点续传。"""
+    want = end - start + 1
     attempt = 0
-    t0 = time.time()
     while True:
+        have = path.stat().st_size if path.exists() else 0
+        if have >= want:
+            return
         attempt += 1
-        have = part.stat().st_size if part.exists() else 0
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": UA,
-        }
-        if have:
-            headers["Range"] = f"bytes={have}-"
-        req = urllib.request.Request(url, headers=headers)
         try:
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": UA,
+                "Range": f"bytes={start + have}-{end}",
+            })
             with _opener().open(req, timeout=timeout) as r:
-                code = r.status
-                if code == 200 and have:
-                    # 服务器忽略了 Range：只能从头来
-                    print("  · 服务端不支持续传，重新开始")
-                    have = 0
-                    part.unlink(missing_ok=True)
-                    part.touch()
-                elif code == 206:
-                    part.open("ab").close()
-                elif code == 416:
-                    # 已下完
-                    total = have
-                    break
-
-                cr = r.headers.get("Content-Range")
-                if cr and "/" in cr:
-                    total = int(cr.split("/")[-1])
-                else:
-                    cl = r.headers.get("Content-Length")
-                    total = (int(cl) + have) if cl else None
-
-                mode = "ab" if have else "wb"
-                done = have
-                t_last = time.time()
-                with part.open(mode) as f:
-                    while True:
-                        chunk = r.read(1 << 18)   # 256 KiB
+                if r.status == 200 and have:
+                    raise RuntimeError("服务端忽略了 Range，无法续传")
+                with path.open("ab" if have else "wb") as f:
+                    got = have
+                    while got < want:
+                        chunk = r.read(1 << 18)      # 256 KiB
                         if not chunk:
                             break
                         f.write(chunk)
-                        done += len(chunk)
-                        now = time.time()
-                        if now - t_last >= 0.5:
-                            pct = f"{done * 100 / total:5.1f}%" if total else "  ?  "
-                            spd = done / max(now - t0, 1e-6)
-                            left = (total - done) / spd if (total and spd > 0) else 0
-                            print(f"\r  {pct}  {human(done)}"
-                                  f"{'/' + human(total) if total else ''}"
-                                  f"  {human(spd)}/s  剩 {int(left)}s   ",
-                                  end="", flush=True)
-                            t_last = now
-            if total is not None:
-                got = part.stat().st_size
-                if got != total:
-                    raise urllib.error.ContentTooShortError(
-                        f"预期 {total} 字节，实得 {got}", None)
-            print(f"\r  完成 {human(part.stat().st_size)}" + " " * 40)
-            part.replace(dest)
-            return
+                        got += len(chunk)
+                        prog.add(len(chunk))
+            if path.stat().st_size >= want:
+                return
+            raise RuntimeError(f"分片 {label} 提前结束"
+                               f"（{path.stat().st_size}/{want}）")
         except Exception as exc:  # noqa: BLE001 —— 网络层什么都可能抛
             if attempt > retries:
+                raise
+            time.sleep(min(2 ** attempt, 30))
+
+
+def _fetch_single(url: str, token: str, path: Path, timeout: float,
+                  retries: int, prog: _Progress, total: int | None) -> None:
+    """单连接顺序下载（服务端不支持 Range 或文件很小时的路径）。"""
+    attempt = 0
+    while True:
+        have = path.stat().st_size if path.exists() else 0
+        if total is not None and have >= total:
+            return
+        attempt += 1
+        try:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": UA,
+            }
+            if have:
+                headers["Range"] = f"bytes={have}-"
+            req = urllib.request.Request(url, headers=headers)
+            with _opener().open(req, timeout=timeout) as r:
+                if r.status == 200 and have:
+                    # 服务器忽略了 Range：只能从头来
+                    print("\n  · 服务端不支持续传，重新开始")
+                    have = 0
+                    path.unlink(missing_ok=True)
+                elif r.status == 416:
+                    return
+                cr = r.headers.get("Content-Range")
+                if cr and "/" in cr:
+                    total = int(cr.rsplit("/", 1)[-1])
+                elif total is None:
+                    cl = r.headers.get("Content-Length")
+                    total = (int(cl) + have) if cl else None
+                with path.open("ab" if have else "wb") as f:
+                    while True:
+                        chunk = r.read(1 << 18)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        prog.add(len(chunk))
+            if total is None or path.stat().st_size >= total:
+                return
+            raise RuntimeError(f"提前结束（{path.stat().st_size}/{total}）")
+        except Exception as exc:  # noqa: BLE001
+            if attempt > retries:
                 raise SystemExit(f"✗ 下载失败（重试 {retries} 次）：{exc}")
-            wait = min(2 ** attempt, 30)
-            print(f"\n  ! 第 {attempt} 次出错：{exc}；{wait}s 后断点续传重试")
-            time.sleep(wait)
+            print(f"\n  ! 第 {attempt} 次出错：{exc}；断点续传重试")
+            time.sleep(min(2 ** attempt, 30))
+
+
+def _monitor(prog: _Progress, total: int | None, t0: float,
+             stop: threading.Event) -> None:
+    """每 0.5s 打一行聚合进度。分片模式下只有一个线程刷屏，不会互相打架。"""
+    while not stop.wait(0.5):
+        done = prog.get()
+        el = max(time.time() - t0, 1e-6)
+        spd = done / el
+        left = (total - done) / spd if (total and spd > 0) else 0
+        pct = f"{done * 100 / total:5.1f}%" if total else "  ?  "
+        print(f"\r  {pct}  {human(done)}"
+              f"{'/' + human(total) if total else ''}"
+              f"  {human(spd)}/s  剩 {int(left)}s   ", end="", flush=True)
+
+
+def _join(parts: list[Path], dest: Path) -> None:
+    """按序拼接分片 → dest，并清掉临时分片。"""
+    tmp = dest.with_name(dest.name + ".join")
+    with tmp.open("wb") as out:
+        for p in parts:
+            with p.open("rb") as f:
+                shutil.copyfileobj(f, out, 1 << 20)
+    tmp.replace(dest)
+    for p in parts:
+        p.unlink(missing_ok=True)
+
+
+def download_file(url: str, dest: Path, token: str, timeout: float,
+                  retries: int = 5, parts: int = 4) -> None:
+    """下载到 dest，默认 4 分片并发，各自断点续传，最后按序拼接。
+
+    文件名统一为 `<dest>.partN`：分片数变化时，`.part0` 这类前缀相同的
+    临时文件仍能各自续传（只要那个区间的起点没变）。
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+
+    total, ranged = probe_total(url, token, timeout)
+    if parts > 1 and not ranged:
+        print("  · 服务端不支持 Range，退回单连接")
+        parts = 1
+    if total:
+        # 每片至少 4 MiB，否则分片开销盖过收益
+        parts = max(1, min(parts, -(-total // (4 << 20))))
+
+    if parts <= 1:
+        paths = [dest.with_name(dest.name + ".part0")]
+        pre = min(paths[0].stat().st_size, total or 1 << 62) if paths[0].exists() else 0
+        print(f"→ 单连接下载{f'（{human(total)}）' if total else ''}"
+              f"{f'，续传 {human(pre)}' if pre else ''}")
+        prog = _Progress(pre)
+        stop = threading.Event()
+        threading.Thread(target=_monitor, args=(prog, total, t0, stop),
+                         daemon=True).start()
+        try:
+            _fetch_single(url, token, paths[0], timeout, retries, prog, total)
+        finally:
+            stop.set()
+        _join(paths, dest)
+        print(f"\r  完成 {human(dest.stat().st_size)}"
+              f"（{time.time() - t0:.0f}s）" + " " * 24)
+        return
+
+    span = -(-total // parts)
+    spans = [(i * span, min(total, (i + 1) * span) - 1) for i in range(parts)]
+    paths = [dest.with_name(dest.name + f".part{i}") for i in range(parts)]
+    pre = sum(min(p.stat().st_size, spans[i][1] - spans[i][0] + 1)
+              for i, p in enumerate(paths) if p.exists())
+    prog = _Progress(pre)
+
+    print(f"→ {parts} 分片并发（每片约 {human(span)}，共 {human(total)}"
+          f"{f'，已续传 {human(pre)}' if pre else ''}）")
+
+    errors: list[BaseException] = []
+
+    def guard(i: int) -> None:
+        s, e = spans[i]
+        try:
+            _fetch_range(url, token, paths[i], s, e, timeout, retries, prog, i)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=guard, args=(i,), daemon=True)
+               for i in range(parts)]
+    stop = threading.Event()
+    threading.Thread(target=_monitor, args=(prog, total, t0, stop),
+                     daemon=True).start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stop.set()
+
+    if errors:
+        raise SystemExit(f"✗ 下载失败：{errors[0]}")
+
+    _join(paths, dest)
+    print(f"\r  完成 {human(dest.stat().st_size)}"
+          f"（{time.time() - t0:.0f}s）" + " " * 24)
 
 
 def sha256_of(path: Path) -> str:
@@ -295,7 +447,8 @@ def cmd_download(args) -> int:
 
     zip_path = out_dir / f"{name}.zip"
     download_file(f"{API}/repos/{args.repo}/actions/artifacts/"
-                  f"{args.artifact}/zip", zip_path, token, args.timeout)
+                  f"{args.artifact}/zip", zip_path, token, args.timeout,
+                  parts=args.parts)
 
     if digest and digest.startswith("sha256:"):
         got = sha256_of(zip_path)
@@ -403,12 +556,15 @@ def main() -> int:
     p.add_argument("--run", type=int, required=True)
     p.set_defaults(func=cmd_arts)
 
-    p = sub.add_parser("download", help="下载 artifact（超时+续传+digest 校验）")
+    p = sub.add_parser("download",
+                       help="下载 artifact（多分片并发+超时+续传+digest 校验）")
     p.add_argument("--repo", required=True)
     p.add_argument("--artifact", type=int, required=True)
     p.add_argument("--out", default="dist")
     p.add_argument("--timeout", type=float, default=60.0,
                    help="单次读操作的 socket 超时秒数")
+    p.add_argument("--parts", type=int, default=4,
+                   help="并发分片数（默认 4；服务端不支持 Range 时自动退回 1）")
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser("verify", help="校验离线包结构与 wheel 覆盖度")

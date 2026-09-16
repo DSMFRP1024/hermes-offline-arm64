@@ -103,7 +103,8 @@ offline-deploy/
 │   ├── test_native_mode.py    参数不变量测试（19 项断言，CI 前置）
 │   ├── check_undefined.py     零依赖 AST 未定义名检查（CI 前置）
 │   ├── test_workflow.py       工作流自检：YAML / run 块语法 / inputs 引用 / pipefail
-│   ├── gh_run.py              查运行 / 下载 artifact / 校验离线包（超时+续传）
+│   ├── gh_run.py              查运行 / 下载 artifact / 校验离线包（多分片+续传）
+│   ├── test_download.py       下载器自测（并发分片 / 续传 / 拼接，本地 Range 服务）
 │   ├── push_api.py            用 Git Data API 推送（github.com 的 git push 走不通时）
 │   ├── test_push_api.py       push_api 的 blob 批量解析逐字节自测
 │   └── requirements.in        参考用
@@ -171,10 +172,12 @@ marker 劫持那一整套交叉 hack —— 那是"在错误的平台上伪装�
 
 ```bash
 python build/check_undefined.py build/build_bundle.py build/test_native_mode.py \
-       build/gh_run.py build/test_workflow.py build/push_api.py build/test_push_api.py
+       build/gh_run.py build/test_workflow.py build/push_api.py \
+       build/test_push_api.py build/test_download.py
 python build/test_native_mode.py
 python build/test_workflow.py
 python build/test_push_api.py
+python build/test_download.py
 bash -n build/ci-entry.sh target/install.sh target/check-env.sh
 ```
 
