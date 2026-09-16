@@ -339,6 +339,26 @@ def _monitor(prog: _Progress, total: int | None, t0: float,
               f"  {human(spd)}/s  剩 {int(left)}s   ", end="", flush=True)
 
 
+def _rm(p: Path) -> None:
+    """尽最大努力删除临时文件。
+
+    某些环境会把 `os.unlink` / `Path.unlink` 劫持成"送进回收站"
+    （Windows 上走 `SHFileOperationW`）。回收站对**单个文件有容量配额**，
+    几十上百 MB 的分片会直接失败并抛 OSError —— 于是拼接明明成功了，
+    整个 `download` 却在这里崩掉，连后面的 digest 校验都跑不到。
+
+    对策：先把文件 truncate 到 0 再删（此时它已在配额内），
+    并且删除失败只告警 —— 绝不能因为清理不掉临时文件而否定已完成的下载。
+    """
+    try:
+        if p.exists() and p.stat().st_size:
+            with p.open("r+b") as f:
+                f.truncate(0)
+        p.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! 清理 {p.name} 失败（不影响下载结果）：{exc}")
+
+
 def _join(parts: list[Path], dest: Path) -> None:
     """按序拼接分片 → dest，并清掉临时分片。"""
     tmp = dest.with_name(dest.name + ".join")
@@ -348,7 +368,7 @@ def _join(parts: list[Path], dest: Path) -> None:
                 shutil.copyfileobj(f, out, 1 << 20)
     tmp.replace(dest)
     for p in parts:
-        p.unlink(missing_ok=True)
+        _rm(p)
 
 
 def download_file(url: str, dest: Path, token: str, timeout: float,
@@ -362,6 +382,13 @@ def download_file(url: str, dest: Path, token: str, timeout: float,
     t0 = time.time()
 
     total, ranged = probe_total(url, token, timeout)
+
+    # 幂等：目标已存在且长度与源一致，就别再下一遍。
+    # 让"下载 → 校验 → 解包"这条链路可以安全重跑（比如上一次在解包阶段失败）。
+    if dest.exists() and total and dest.stat().st_size == total:
+        print(f"  · 已存在且长度正确（{human(total)}），跳过下载")
+        return
+
     if parts > 1 and not ranged:
         print("  · 服务端不支持 Range，退回单连接")
         parts = 1
