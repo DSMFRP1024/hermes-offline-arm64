@@ -13,6 +13,9 @@ node_modules/
 browsers/
 bin/
 
+# 推送工具（build/push_api.py）的落盘日志
+.push-api.log
+
 # Python
 __pycache__/
 *.py[cod]
