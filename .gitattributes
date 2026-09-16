@@ -1,0 +1,26 @@
+# 强制这些文件在 git 对象里用 LF 行尾。
+#
+# 不这么做的话：Windows 上 `core.autocrlf=true` 会把 .sh 存成 CRLF，
+# 推到 GitHub 后 CI 里 checkout 出来仍是 LF（有 .gitattributes 才会），
+# 但如果不加这一条、又不小心用 `--no-verify`/直接 API 推送，
+# 脚本拷到 Linux 就是 `bad interpreter: /bin/bash^M: no such file or directory`
+# —— 而且报错信息完全不提行尾，极难排查。
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.in text eol=lf
+
+# 二进制，别碰
+*.whl binary
+*.tar.gz binary
+*.xz binary
+*.zip binary
+*.so binary
+*.node binary
+*.part binary

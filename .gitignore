@@ -1,0 +1,28 @@
+# 构建产物与临时区
+dist/
+.offline-build/
+.ci/
+logs/
+build/.tools/
+
+# 构建期下载的运行时 / wheel / node_modules（体积大，不入库）
+runtime/
+wheels/
+wheels-prebuilt/
+node_modules/
+browsers/
+bin/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

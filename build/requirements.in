@@ -1,0 +1,55 @@
+# =============================================================================
+# 参考文件 —— **不是构建输入**
+# =============================================================================
+#
+# 本项目的 Python 依赖清单**不来自这个文件**，而是构建时从 hermes-agent
+# 仓库自带的 uv.lock 导出：
+#
+#     uv export --frozen --no-emit-project --extra all \
+#         --format requirements-txt --no-hashes
+#
+# 为什么不用手写需求文件：
+#   uv.lock 里每个包都带**所有平台** wheel 的 URL + sha256，
+#   且 --extra all 对应的是上游精心裁剪过的集合（见 pyproject.toml 里
+#   [project.optional-dependencies].all 的那段 policy 注释）。
+#   手写一份必然与上游漂移，而且一旦漂移就是"装出来的东西和官方不一样"。
+#
+# 这个文件只用来记录"离线包里到底装了哪一类东西"，方便日后复核。
+# =============================================================================
+
+# ── 核心依赖（hermes-agent [project].dependencies 的子集摘录）──
+# openai==2.24.0             LLM 客户端
+# pydantic==2.13.4           数据模型（含 pydantic-core，Rust 原生扩展）
+# cryptography==50.0.0       TLS / JWT（Rust 原生扩展）
+# Pillow==12.3.0             图像处理（vision 工具）
+# pillow-heif>=1.4.0         HEIC/AVIF 解码（自带 libheif）
+# psutil==7.2.2              进程管理（原生扩展）
+# httpx[socks]==0.28.1       HTTP 客户端
+# fastapi / uvicorn          dashboard 与 gateway
+# nemo-relay>=0.8.3,<0.9     仅 linux aarch64 / x86_64 等平台（原生扩展）
+# firecrawl-anydoc==0.2.4    PDF/Office → Markdown 抽取
+
+# ── [all] extra（上游 curated 集合，刻意不含 lazy-install 的那些）──
+# hermes-agent[cron]              仅依赖 core 里的 croniter
+# hermes-agent[pty]               no-op（ptyprocess 已在 core）
+# hermes-agent[mcp]               mcp==2.0.0 + httpx2 + starlette
+# hermes-agent[homeassistant]     aiohttp
+# hermes-agent[sms]               aiohttp
+# hermes-agent[acp]               agent-client-protocol==0.9.0
+# hermes-agent[google]            Google Workspace 系列 SDK
+# hermes-agent[web]               fastapi + uvicorn + starlette + python-multipart
+# hermes-agent[youtube]           youtube-transcript-api
+
+# ── 目标机 editable 安装所需的构建后端 ──
+# 版本必须与 pyproject.toml 的 [build-system].requires 一致，
+# 因为安装时用 --no-build-isolation（离线环境建不了隔离环境）。
+setuptools==83.0.0
+wheel
+
+# ── 刻意不包含 ──
+# [wake] / [voice]   onnxruntime / faster-whisper / numpy：体积大（数百 MB），
+#                    且信创机上没有可用麦克风设备。需要时在构建参数里放开。
+# [matrix]           python-olm 只有 Linux wheel、无跨平台构建路径。
+# honcho / supermemory / mem0 / mistral / otlp
+#                    上游刻意排除在 [all] 之外（防止某个被隔离的 PyPI 版本
+#                    搞挂所有新装），走 lazy-install。离线机上因此不可用。
