@@ -9,7 +9,8 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 **换成一个可以在零网络机器上跑的离线包**：自带 Python 运行时、全部
 aarch64 wheel、Node.js、预构建 node_modules、Playwright Chromium、
 ripgrep/ffmpeg、编译好的原生扩展，以及**预编译好的 dashboard 前端**
-（Web 控制台开箱即用，目标机不需要 npm）。目标机只要解压 + 一条 `install.sh`。
+与**预打包好的 Hermes Desktop（Electron 桌面壳）**（图形界面开箱即用，
+目标机不需要 npm，也不需要下载 Electron）。目标机只要解压 + 一条 `install.sh`。
 
 ---
 
@@ -81,11 +82,18 @@ hermes doctor              # 自检
 vi /root/.hermes/.env      # 填模型 API key（必做）
 hermes                     # 命令行交互
 hermes dashboard           # Web 控制台 → http://127.0.0.1:9119
+hermes desktop             # 桌面应用（Electron 窗口，需图形会话）
 ```
 
 `hermes dashboard` 直接可用：前端已经预编译在包里，`install.sh` 也补写了
 构建戳，所以它**不会**去跑 `npm install`。如果哪次真提示要重建，加
 `--skip-build` 直接服务包内 dist 即可。
+
+`hermes desktop` 同理：Electron 运行时（~290 MiB 解包）已经预打包进
+`desktop/hermes-desktop-linux-arm64.tar.gz`，`install.sh` 解压到位并补写
+构建戳，所以它**不会**去 `npm ci`、也不会经 `@electron/get` 下载 Electron。
+它需要一个图形会话（X11/Wayland）；无头机器请用 `hermes dashboard`。
+救急也可以用 `hermes desktop --skip-build` 强制跳过"要不要重建"的判断。
 
 常用参数：
 
@@ -107,7 +115,8 @@ offline-deploy/
 │   ├── build_bundle.py        构建器主程序（原生模式）
 │   ├── ci-entry.sh            容器内入口（CI 调用）
 │   ├── test_native_mode.py    参数不变量测试（19 项断言，CI 前置）
-│   ├── test_web_ui.py         dashboard 前端预编译不变量（23 项断言，CI 前置）
+│   ├── test_web_ui.py         dashboard 前端预编译不变量（39 项断言，CI 前置）
+│   ├── test_desktop.py        Hermes Desktop 预打包不变量（63 项断言，CI 前置）
 │   ├── check_undefined.py     零依赖 AST 未定义名检查（CI 前置）
 │   ├── test_workflow.py       工作流自检：YAML / run 块语法 / inputs 引用 / pipefail
 │   ├── gh_run.py              查运行 / 下载 artifact / 校验离线包（多分片+续传）
@@ -142,6 +151,9 @@ hermes-offline-arm64/
 ├── node_modules/      预构建的 node_modules（含 node-pty 原生模块）
 │                      repo/ 快照里已排除，避免整棵依赖树在包里存两遍
 ├── browsers/          Playwright Chromium（linux-arm64）
+├── desktop/           Hermes Desktop 的 Electron unpacked 树（tar.gz）
+│                      含 renderer（app.asar.unpacked/dist）与按 Electron ABI
+│                      重编的 node-pty；repo/ 快照里已排除 release/ 那份副本
 ├── bin/               ripgrep / ffmpeg / uv
 ├── lib/               fts5_cjk.so（中文分词检索加速）
 ├── requirements.lock.txt / requirements.universal.txt
@@ -177,10 +189,11 @@ marker 劫持那一整套交叉 hack —— 那是"在错误的平台上伪装�
 里**排除**了 `node_modules`（`REPO_EXCLUDES`）—— 早期漏了这项，整棵依赖树
 （预编译前端后 343 MiB）在包里存了两份。
 
-装依赖时必须**一条命令覆盖 root + ui-tui + web**：
+装依赖时必须**一条命令覆盖全部 workspace**（带桌面版时的完整形式）：
 
 ```bash
-npm ci --workspace ui-tui --workspace web --include-workspace-root
+npm ci --workspace ui-tui --workspace web --workspace apps/desktop \
+       --workspace apps/shared --include-workspace-root
 ```
 
 ⚠️ 不要"顺手"再进 `ui-tui/` 补一次 `npm ci` —— `ui-tui` 没有自己的 lock，
@@ -209,6 +222,31 @@ npm 会向上找到工作区根的 lock 并按「只含该子树」reify，把�
 `build/test_web_ui.py` 把这条链钉死，其中最要紧的一条是：
 **`build_web_ui()` 必须排在 `pack_repo()` 之前** —— 排在后面，
 产物就进不了源码快照，等于白编。
+
+### 5. Hermes Desktop（Electron 壳）同样预打包
+
+`apps/desktop/` 是 Electron 40 + React 19 的原生壳，命令是 `hermes desktop`
+（别名 `hermes gui`）。它的默认启动路径比 dashboard 更重：npm ci →
+electron-builder → `@electron/get` 下载 Electron 运行时（约 110 MiB，
+解包约 290 MiB）。离线机上这三步一步都走不通。
+
+所以构建机把它整棵 `linux-arm64-unpacked` 打成一个 tar.gz 放进
+`desktop/`，`install.sh` 解压到 `apps/desktop/release/`（上游
+`_desktop_packaged_executable_in()` 认的位置），再补写
+`$HERMES_HOME/desktop-build-stamp.json`。三个必须记住的点：
+
+- **打包只能用 `npm run pack`（= `builder --dir`）**，不能用 AppImage/deb/rpm。
+  后三者的 target 都要调 `fpm`，而 electron-builder 分发的 fpm
+  **只有 x86_64** —— 在 arm64 构建机上必然失败。`--dir` 只产出 unpacked 目录。
+- **`node-pty` 必须重编到 Electron ABI**。npm ci 编出来的是 Node ABI
+  （Node 24 = 137），Electron 40 要 143（`apps/desktop/scripts/rebuild-native.mjs`，
+  即 `@electron/rebuild`）。不匹配时内嵌终端报 `NODE_MODULE_VERSION` mismatch。
+- **戳里 `sourceMode` 必须是 `false`**。上游 `_stamp_is_current()` 会比对它，
+  写成 `true` 等于没写，裸跑仍会去 npm 构建。
+
+`build/test_desktop.py`（63 项断言）把上面每一条连同调用顺序
+（`fetch_node_modules` → `build_desktop` → `pack_repo`）、
+`REPO_EXCLUDES` 里的 `apps/desktop/release` 一起钉死。
 
 ---
 
@@ -254,3 +292,9 @@ bash -n build/ci-entry.sh target/install.sh target/check-env.sh
 5. **Chromium 运行时依赖系统库**。信创机默认常缺 `libnss3`/`libgbm`/
    `libasound2` 等；`check-env.sh` 会逐个列出缺哪个，装系统包即可
    （不影响核心 CLI）。
+6. **Hermes Desktop 需要图形会话与 GTK3 一整套**。Electron 自带 Chromium，
+   但 GTK3/NSS/GBM/atspi 这些要宿主提供，且大多是启动时 `dlopen` 的
+   （`ldd` 查不出来）—— `check-env.sh` 会查 `ldconfig` 缓存并逐个列出。
+   无 X11/Wayland 会话的机器上起不来，那就用 `hermes dashboard`。
+   构建时加 `--skip-desktop`（或 CI 勾 `skip_desktop`）可以不打这一份，
+   包会小 ~120 MiB。

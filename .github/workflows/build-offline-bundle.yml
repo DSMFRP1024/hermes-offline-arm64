@@ -42,6 +42,10 @@ on:
         description: '跳过 ripgrep/ffmpeg'
         type: boolean
         default: false
+      skip_desktop:
+        description: '跳过 Hermes Desktop（Electron 桌面壳，打包耗时且体积大）'
+        type: boolean
+        default: false
   push:
     tags:
       - 'bundle-*'
@@ -74,13 +78,16 @@ jobs:
               build/build_bundle.py build/test_native_mode.py \
               build/check_undefined.py build/gh_run.py build/test_workflow.py \
               build/push_api.py build/test_push_api.py build/test_download.py \
-              build/test_web_ui.py
+              build/test_web_ui.py build/test_desktop.py
           echo ""
           echo "── 原生模式参数不变量（锁死 pip 调用参数）──"
           python3 build/test_native_mode.py
           echo ""
           echo "── dashboard 前端预编译不变量（锁死离线可用的 Web UI）──"
           python3 build/test_web_ui.py
+          echo ""
+          echo "── Hermes Desktop 预打包不变量（锁死离线可用的 Electron 壳）──"
+          python3 build/test_desktop.py
           echo ""
           echo "── 工作流自检（YAML / run 块语法 / inputs 引用 / pipefail 陷阱）──"
           python3 build/test_workflow.py
@@ -106,12 +113,14 @@ jobs:
           PYPI_INDEX: ${{ github.event.inputs.pypi_index }}
           SKIP_PLAYWRIGHT: ${{ github.event.inputs.skip_playwright }}
           SKIP_MEDIA: ${{ github.event.inputs.skip_media }}
+          SKIP_DESKTOP: ${{ github.event.inputs.skip_desktop }}
         run: |
           set -euo pipefail
           # 这些 input 在 push 触发时是空串，ci-entry.sh 里各自有默认值。
           # 空串传进去不会覆盖默认值（用的 ${VAR:-default} 语义）。
           [ "$SKIP_PLAYWRIGHT" = "true" ] || SKIP_PLAYWRIGHT=""
           [ "$SKIP_MEDIA" = "true" ] || SKIP_MEDIA=""
+          [ "$SKIP_DESKTOP" = "true" ] || SKIP_DESKTOP=""
 
           docker run --rm \
             -v "$PWD:/work" \
@@ -123,6 +132,7 @@ jobs:
             -e PYPI_INDEX \
             -e SKIP_PLAYWRIGHT \
             -e SKIP_MEDIA \
+            -e SKIP_DESKTOP \
             -e GITHUB_TOKEN \
             quay.io/pypa/manylinux_2_28_aarch64 \
             bash /work/build/ci-entry.sh
@@ -148,7 +158,9 @@ jobs:
           LIST=$(mktemp)
           REPO_TGZ=$(mktemp)
           REPO_LIST=$(mktemp)
-          trap 'rm -f "$LIST" "$REPO_TGZ" "$REPO_LIST"' EXIT
+          DT_TGZ=$(mktemp)
+          DT_LIST=$(mktemp)
+          trap 'rm -f "$LIST" "$REPO_TGZ" "$REPO_LIST" "$DT_TGZ" "$DT_LIST"' EXIT
           tar -tzf "$TB" > "$LIST"
 
           echo "── 结构抽检 ──"
@@ -173,6 +185,9 @@ jobs:
           hermes-offline-arm64/node_modules/node_modules.tar.gz
           hermes-offline-arm64/node_modules/ui-tui__node_modules.tar.gz
           hermes-offline-arm64/node_modules/web__node_modules.tar.gz
+          hermes-offline-arm64/node_modules/apps__desktop__node_modules.tar.gz
+          hermes-offline-arm64/node_modules/apps__shared__node_modules.tar.gz
+          hermes-offline-arm64/desktop/hermes-desktop-linux-arm64.tar.gz
           "
           miss=0
           for must in $musts; do
@@ -216,6 +231,29 @@ jobs:
           [ "$miss" -eq 0 ] || exit 1
           echo "  ✓ dashboard 前端已预编译（web_dist/assets 有 $WEB_ASSETS 个 js/css）"
 
+          # ── Hermes Desktop 必须已预打包 ──
+          # 目标机零网络。上游 `hermes desktop` 找不到 unpacked 产物时会 npm ci，
+          # 再让 electron-builder 经 @electron/get 下载 Electron 运行时（~110 MiB），
+          # 离线必失败。产物单独放在 desktop/*.tar.gz，不在源码快照里 ——
+          # 所以要把它取出来再列一遍才看得见（和 repo 快照同一个套路）。
+          tar -xzf "$TB" -O hermes-offline-arm64/desktop/hermes-desktop-linux-arm64.tar.gz > "$DT_TGZ"
+          tar -tzf "$DT_TGZ" > "$DT_LIST"
+          if ! grep -qE '(^|/)linux-(arm64-)?unpacked/(hermes|Hermes)$' "$DT_LIST"; then
+            echo "✗ desktop tarball 里没有 unpacked 可执行文件 —— 桌面版没打进包" >&2
+            miss=1
+          fi
+          if ! grep -qE 'app\.asar\.unpacked/dist/index\.html$' "$DT_LIST"; then
+            echo "✗ desktop tarball 里没有 renderer 产物 —— --skip-build 起来是白窗口" >&2
+            miss=1
+          fi
+          DT_NODES=$(grep -cE 'app\.asar\.unpacked/.*\.node$' "$DT_LIST" || true)
+          if [ "${DT_NODES:-0}" -eq 0 ]; then
+            echo "✗ desktop tarball 里没有原生模块 —— 内嵌终端（node-pty）会不可用" >&2
+            miss=1
+          fi
+          [ "$miss" -eq 0 ] || exit 1
+          echo "  ✓ 桌面版已预打包（unpacked 树 + renderer + $DT_NODES 个原生模块）"
+
           # ── 依赖树不许在源码快照里重复 ──
           # node_modules 只由 bundle/node_modules/*.tar.gz 携带。REPO_EXCLUDES 一旦
           # 漏了它，源码快照里会再塞进一整棵依赖树（实测 8863 个文件，占了 src
@@ -227,6 +265,15 @@ jobs:
           if grep -qE '^hermes-agent/.*node_modules/' "$REPO_LIST"; then
             echo "✗ 源码快照里混进了 node_modules —— REPO_EXCLUDES 漏了它" >&2
             grep -E '^hermes-agent/.*node_modules/' "$REPO_LIST" | sed -n '1,3p' >&2
+            miss=1
+          fi
+          # 桌面版同理：apps/desktop/release/ 是 npm run pack 的产物（Electron
+          # 运行时本体，解包 290 MiB 量级），它由 desktop/*.tar.gz 单独携带。
+          # REPO_EXCLUDES 一旦漏了它，源码快照里会再存一份一模一样的 ——
+          # 症状同样是"包莫名大了几百 MB，而日志全绿"。
+          if grep -qE '^hermes-agent/apps/desktop/release/' "$REPO_LIST"; then
+            echo "✗ 源码快照里混进了 apps/desktop/release —— REPO_EXCLUDES 漏了它" >&2
+            grep -E '^hermes-agent/apps/desktop/release/' "$REPO_LIST" | sed -n '1,3p' >&2
             miss=1
           fi
           [ "$miss" -eq 0 ] || exit 1
@@ -272,6 +319,7 @@ jobs:
             echo "| 条目总数 | $N |"
             echo "| wheel 数 | $(find dist/hermes-offline-arm64 -name '*.whl' \| wc -l) |"
             echo "| dashboard 前端 | 已预编译（hermes_cli/web_dist，离线免 npm） |"
+            echo "| 桌面版 | 已预打包（desktop/hermes-desktop-linux-arm64.tar.gz，离线免 npm） |"
             echo ""
             echo "构建信息："
             echo '```json'

@@ -225,6 +225,7 @@ class Cfg:
     with_media: bool = True          # ripgrep / ffmpeg
     with_ftscjk: bool = True
     with_web_ui: bool = True        # dashboard 前端（离线包必须带，见 build_web_ui）
+    with_desktop: bool = True       # Electron 桌面版（默认带，见 build_desktop）
     pypi_index: str | None = None
     gh_mirror: bool = False
     token: str | None = None
@@ -300,7 +301,7 @@ def check_host_glibc_not_newer(cfg: Cfg) -> None:
 # ---------------------------------------------------------------------------
 
 def export_requirements(cfg: Cfg, uv_bin: Path, dest: Path) -> None:
-    LOG("── [1/11] 导出依赖闭包（uv export --frozen）──")
+    LOG("── [1/12] 导出依赖闭包（uv export --frozen）──")
     universal = dest / "requirements.universal.txt"
     run(
         [str(uv_bin), "export", "--frozen", "--no-emit-project",
@@ -387,7 +388,7 @@ def inventory(*dirs: Path) -> set[tuple[str, str]]:
 
 
 def fetch_wheels(cfg: Cfg, lock: Path, wheels: Path, prebuilt: Path) -> None:
-    LOG("── [2/11] 下载 wheel（aarch64 原生）──")
+    LOG("── [2/12] 下载 wheel（aarch64 原生）──")
     wheels.mkdir(parents=True, exist_ok=True)
     prebuilt.mkdir(parents=True, exist_ok=True)
 
@@ -488,7 +489,7 @@ def audit_wheels(cfg: Cfg, wheels: Path, prebuilt: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_python_runtime(cfg: Cfg, runtime: Path) -> None:
-    LOG("── [3/11] 独立 CPython 运行时（python-build-standalone）──")
+    LOG("── [3/12] 独立 CPython 运行时（python-build-standalone）──")
     runtime.mkdir(parents=True, exist_ok=True)
 
     pattern = rf"cpython-{re.escape(cfg.python_version)}\.\d+\+\d+-aarch64-unknown-linux-gnu-install_only\.tar\.gz"
@@ -508,7 +509,7 @@ def fetch_python_runtime(cfg: Cfg, runtime: Path) -> None:
 
 
 def fetch_uv(cfg: Cfg, tools: Path) -> Path:
-    LOG("── [4/11] uv（aarch64 二进制）──")
+    LOG("── [4/12] uv（aarch64 二进制）──")
     tools.mkdir(parents=True, exist_ok=True)
     mirrors = GH_MIRRORS if cfg.gh_mirror else ()
     tag, url, _ = gh_release_asset("astral-sh/uv", r"uv-aarch64-unknown-linux-gnu\.tar\.gz",
@@ -528,7 +529,7 @@ def fetch_uv(cfg: Cfg, tools: Path) -> Path:
 
 
 def fetch_node(cfg: Cfg, runtime: Path) -> Path:
-    LOG("── [5/11] Node.js（linux-arm64）──")
+    LOG("── [5/12] Node.js（linux-arm64）──")
     idx = http_json("https://nodejs.org/dist/index.json")
     lines = [cfg.node_line] + [l for l in NODE_LINES if l != cfg.node_line]
 
@@ -626,6 +627,79 @@ def assert_web_toolchain(repo: Path) -> None:
     LOG(f"  ✓ web 构建链依赖已就绪（{len(WEB_TOOLCHAIN_REQUIRED)} 个关键包）")
 
 
+# 桌面版构建链上"少一个就必炸"的包：上游 apps/desktop/scripts/assert-root-install.mjs
+# 的 floor（vite/katex/electron/electron-builder）加上 vite.config.ts 与
+# bundle-electron-main.mjs 实际 import 的那几个。
+DESKTOP_TOOLCHAIN_REQUIRED = (
+    "electron",             # electron-builder 打进 unpacked 树的运行时本体
+    "electron-builder",     # `npm run builder` 本体
+    "@electron/rebuild",    # 把 node-pty 重编成 Electron ABI
+    "vite",
+    "katex",
+    "esbuild",
+    "react",
+    "react-dom",
+    "@vitejs/plugin-react",
+    "@tailwindcss/vite",
+    "@rolldown/plugin-babel",
+)
+
+
+def assert_desktop_toolchain(repo: Path) -> None:
+    """确认桌面版的构建依赖真的落在 node_modules 里（理由同 assert_web_toolchain）。
+
+    额外验一条上游也验的东西：react / react-dom 必须**同版本** —— 版本不一致时
+    vite 的 react 别名会让两者来自不同副本，React 抛 #527 并渲染出全白窗口，
+    而 npm 对此完全沉默（hoist 的那份仍满足 caret peer range）。
+    """
+    roots = [repo / "apps" / "desktop" / "node_modules", repo / "node_modules"]
+    missing = [name for name in DESKTOP_TOOLCHAIN_REQUIRED
+               if not any((r / name / "package.json").is_file() for r in roots)]
+    if missing:
+        raise SystemExit(
+            "桌面版构建依赖没有被装上：%s\n"
+            "  apps/desktop 的依赖被 hoist 到根 node_modules，所以它必须出现在"
+            " fetch_node_modules() 的 workspace 列表里（apps/desktop + apps/shared）。"
+            % ", ".join(missing))
+
+    def _ver(name: str) -> str | None:
+        for r in roots:
+            pkg = r / name / "package.json"
+            if pkg.is_file():
+                try:
+                    return json.loads(pkg.read_text(encoding="utf-8")).get("version")
+                except (OSError, json.JSONDecodeError):
+                    return None
+        return None
+
+    react, react_dom = _ver("react"), _ver("react-dom")
+    if react != react_dom:
+        raise SystemExit(
+            "react@%s 与 react-dom@%s 版本不一致 —— React 会抛 #527 渲染出白屏"
+            "（npm 不会报任何错）。" % (react, react_dom))
+    LOG(f"  ✓ 桌面版构建链依赖已就绪（{len(DESKTOP_TOOLCHAIN_REQUIRED)} 个关键包，"
+        f"react={react}）")
+
+
+def _nm_tarball_filter(ti: tarfile.TarInfo):
+    """打"给目标机的 node_modules"时排掉 Electron 运行时本体。
+
+    `node_modules/electron/dist/` 是 @electron/get 下载后解开的那份 Chromium
+    运行时（解包 200 MiB 上下），只有 electron-builder **打包**时才需要。目标机的
+    CLI 永远不启动 Electron（桌面版用的是随 `desktop/` 单独分发、已经打包好的
+    unpacked 树），带上它纯粹白占体积。
+
+    只排 electron 包自己的 dist —— 按路径段判断，避免误伤
+    `@electron/rebuild/dist` 这类路径里含 "electron" 的正常产物。
+    """
+    parts = ti.name.split("/")
+    if "electron" in parts:
+        i = parts.index("electron")
+        if i + 1 < len(parts) and parts[i + 1] == "dist":
+            return None
+    return ti
+
+
 def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     """预构建 node_modules。
 
@@ -633,16 +707,29 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     每次安装都要 node-gyp 编译，而信创机通常没有 make/gcc。
     在容器里编好再打包，目标机就只是解压 —— 彻底消灭编译器依赖。
 
-    只装 CLI 实际需要的 workspace（ui-tui / web + root），
-    故意排除 apps/*：那个 glob 会拉进 Electron + node-pty 的桌面链路，
-    而 CLI 安装永远不会启动 Electron。
+    装哪些 workspace 跟随开关走：
+      · `ui-tui` / `web` —— CLI 的 TUI 与 dashboard 前端，始终装
+      · `apps/desktop` + `apps/shared` —— Electron 桌面版链路，只在
+        `with_desktop` 时装。拉进来会连带 `electron`（postinstall 下载
+        linux-arm64 二进制）和 `electron-builder`，所以默认跟随开关，
+        不需要桌面版时不必付这份体积。
+
+    ⚠️ 顺序敏感：本函数末尾会把 node_modules 打成 tarball 给目标机的
+    **CLI** 用（那时 node-pty 还是 Node ABI）。`build_desktop()` 随后会
+    把它重编成 Electron ABI 并只影响 `apps/desktop/dist` 下的副本 ——
+    所以打包必须发生在那次 rebuild **之前**，否则 CLI 的 node-pty 会被
+    换成 Electron ABI 而在普通 Node 里加载失败。
     """
-    LOG("── [6/11] 预构建 node_modules（root + ui-tui + web）──")
+    LOG("── [6/12] 预构建 node_modules（root + ui-tui + web + desktop）──")
     node_modules.mkdir(parents=True, exist_ok=True)
     repo = cfg.repo
 
+    wanted = ["ui-tui", "web"]
+    if cfg.with_desktop:
+        wanted += ["apps/desktop", "apps/shared"]
+
     ws_args = []
-    for ws in ("ui-tui", "web"):
+    for ws in wanted:
         if (repo / ws / "package.json").exists():
             ws_args += ["--workspace", ws]
     ws_args += ["--include-workspace-root"] if ws_args else ["--workspaces=false"]
@@ -676,38 +763,41 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     LOG(f"  · 根 node_modules 顶层 {n_top} 个条目")
     if cfg.with_web_ui:
         assert_web_toolchain(repo)
+    if cfg.with_desktop:
+        assert_desktop_toolchain(repo)
 
     # 清掉跨平台误装的包（在不同架构宿主上跑过之后会留下），否则目标机会 import 到错的二进制
     n_removed = prune_foreign_native(repo)
 
     # 打包成 tarball（保留符号链接与可执行位）
     made = 0
-    for rel in ("node_modules", "ui-tui/node_modules", "web/node_modules"):
+    for rel in ("node_modules", "ui-tui/node_modules", "web/node_modules",
+                "apps/desktop/node_modules", "apps/shared/node_modules"):
         src = repo / rel
         if not src.is_dir():
             continue
         arc = node_modules / (rel.replace("/", "__") + ".tar.gz")
         with tarfile.open(arc, "w:gz", compresslevel=1) as tf:
-            tf.add(src, arcname=rel)
+            tf.add(src, arcname=rel, filter=_nm_tarball_filter)
         made += 1
         LOG(f"  ✓ {rel}  →  {arc.name}  ({arc.stat().st_size:,} B)")
 
     if not made:
         raise SystemExit("没有产出任何 node_modules，Node 依赖安装可能整体失败了")
 
-    # node-pty 属于 apps/desktop，而 apps/* 是被刻意排除的（见上面 docstring），
-    # 所以正常构建本来就**不该**出现它 —— 早先这里直接检查"有没有 .node"，
-    # 结果是每轮构建都必然打一条"PTY 可能不可用"的警告，把"不在安装范围"
-    # 误报成"构建失败"。真正该报警的是相反情形：它被拉进来了、却没编出来。
+    # node-pty 是 ui-tui（CLI 的终端）与 apps/desktop（Electron 终端面板）共用的
+    # 原生模块，不发 Linux 预编译包，必须在这里 node-gyp 编出来。编不出来时
+    # **命令行其余功能一切正常**，只有终端不可用 —— 所以必须显式报出来。
     nm_dirs = [repo / "node_modules", repo / "ui-tui/node_modules",
-               repo / "web/node_modules"]
+               repo / "web/node_modules", repo / "apps/desktop/node_modules"]
     present = [d for d in nm_dirs if (d / "node-pty").is_dir()]
     if not present:
-        LOG("  · 未包含 node-pty（它在 apps/desktop 里，CLI 链路用不到，属预期）")
+        LOG("  ⚠ 各 workspace 里都没有 node-pty —— CLI 的终端与桌面版终端面板都会不可用")
     # 注意要 any(list(...)) 而不是 any(gen for ...)：后者里每个元素是**生成器
     # 对象**，bool(生成器) 恒为真，条件会永远成立。
     elif any(list((d / "node-pty/build/Release").glob("*.node")) for d in present):
-        LOG("  ✓ node-pty 原生模块已就绪")
+        LOG("  ✓ node-pty 原生模块已就绪（Node ABI；桌面版那份稍后由 "
+            "build_desktop() 重编为 Electron ABI，不影响这里已打好的 tarball）")
     else:
         LOG("  ⚠ 拉进了 node-pty 却没编出 .node —— 终端模拟功能会在目标机不可用")
     LOG(f"  （已清理 {n_removed} 个非 linux-arm64 平台包）")
@@ -757,7 +847,7 @@ def build_web_ui(cfg: Cfg, env: dict) -> None:
     `$HERMES_HOME/web-ui-build-stamp.json` 里的内容哈希，而戳**不在仓库里**。
     那个戳由 target/install.sh 在目标机上写（见该脚本第 9 步）。
     """
-    LOG("── [7/11] 预编译 Web UI（dashboard 前端）──")
+    LOG("── [7/12] 预编译 Web UI（dashboard 前端）──")
     web_dir = cfg.repo / "web"
     dist = cfg.repo / "hermes_cli" / "web_dist"
 
@@ -798,7 +888,119 @@ def build_web_ui(cfg: Cfg, env: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Playwright Chromium（arm64）
+# 8. Electron 桌面版（必须在这里打包成 unpacked 树：离线机既没有 npm 也没有网络）
+# ---------------------------------------------------------------------------
+
+# electron-builder 在 Linux 上的 unpacked 输出目录名。上游
+# `main_desktop._desktop_packaged_executable_in()` 同时认这两个：非 x64 架构
+# 会带 arch 后缀，所以 arm64 上正常是第一个。
+DESKTOP_UNPACKED_DIRS = ("linux-arm64-unpacked", "linux-unpacked")
+DESKTOP_EXE_NAMES = ("hermes", "Hermes")
+DESKTOP_TARBALL_NAME = "hermes-desktop-linux-arm64.tar.gz"
+
+
+def build_desktop(cfg: Cfg, env: dict, dest: Path) -> Path:
+    """把 Electron 桌面版打包成 unpacked 树，单独打 tarball 随包分发。
+
+    为什么必须在构建机做 ——
+    目标机零网络。上游 `hermes desktop` 默认会 npm ci，再让 electron-builder 经
+    `@electron/get` 下载 Electron 运行时（下载约 110 MiB / 解包约 290 MiB），
+    离线必失败。产物打好后，目标机走 `hermes desktop --skip-build` 直接启动这棵树。
+
+    为什么用 `pack` 而不是 `dist:linux` ——
+    `pack` = `npm run build && npm run builder -- --dir`，`--dir` 只产出 unpacked
+    目录、不生成安装器。这点很关键：AppImage / deb / rpm 三个 target 都要调 fpm，
+    而 electron-builder 分发的 fpm **只有 x86_64**，在 arm64 构建机上必然失败。
+    `--dir` 完全绕开这条路；目标机运行期也不需要任何打包工具。
+
+    为什么必须先 rebuild node-pty ——
+    npm ci 把 node-pty 编成 **Node ABI**（Node 24 = 137），而 Electron 40 加载原生
+    模块要 **Electron ABI**（143）。不匹配时终端面板报 NODE_MODULE_VERSION
+    mismatch 后整块不可用。用上游自带的 scripts/rebuild-native.mjs
+    （@electron/rebuild、onlyModules=['node-pty']）重编一次即可。
+
+    ⚠️ 顺序：那次 rebuild 会**改写根 node_modules/node-pty**，所以本函数必须排在
+    `fetch_node_modules()` 之后 —— 那份给 CLI 用的 tarball 到那时已经打好了，
+    否则目标机的 CLI 会拿到 Electron ABI 的 .node 而在普通 Node 里加载失败。
+    """
+    LOG("── [8/12] 打包 Electron 桌面版（unpacked 树）──")
+    desktop_dir = cfg.repo / "apps" / "desktop"
+    if not (desktop_dir / "package.json").exists():
+        raise SystemExit(f"找不到桌面版源码：{desktop_dir / 'package.json'}")
+
+    # 1) 把 node-pty 重编成 Electron ABI。失败不致命：主界面（聊天/预览/文件）
+    #    仍可用，只有内嵌终端受影响 —— 报出来，但别因此作废整个包。
+    rc = run(["node", "scripts/rebuild-native.mjs", "arm64"],
+             cwd=desktop_dir, env=env, check=False, echo=True, timeout=1200)
+    if rc == 0:
+        LOG("  ✓ node-pty 已按 Electron ABI 重建")
+    else:
+        LOG("  ⚠ node-pty 的 Electron ABI 重建失败（exit=%d）：桌面版内嵌终端可能不可用，"
+            "其余功能不受影响" % rc)
+
+    # 2) 打包（build + builder --dir）。重活：vite 编 renderer、esbuild 打 electron
+    #    main、electron-builder 复制 Electron 运行时 —— 给足超时。
+    rc = run(["npm", "run", "pack"], cwd=desktop_dir, env=env, check=False,
+             echo=True, timeout=3600)
+    if rc != 0:
+        raise SystemExit(
+            "桌面版打包失败（exit=%d）。目标机没有 npm 也没有网络，装不上 Electron "
+            "运行时，`hermes desktop` 会直接失败 —— 这里不能放过，先修构建。" % rc)
+
+    # 3) 校验产物落点。上游 _desktop_packaged_executable_in() 找的就是这些路径。
+    release = desktop_dir / "release"
+    exe = None
+    for d in DESKTOP_UNPACKED_DIRS:
+        for n in DESKTOP_EXE_NAMES:
+            cand = release / d / n
+            if cand.is_file():
+                exe = cand
+                break
+        if exe:
+            break
+    if exe is None:
+        seen = [p.as_posix() for p in release.glob("*-unpacked/*")][:10] if release.is_dir() else []
+        raise SystemExit(
+            "打包跑完了，但 %s 里没有 unpacked 可执行文件。\n"
+            "  `hermes desktop --skip-build` 认的是 "
+            "release/{linux-arm64,linux}-unpacked/{hermes,Hermes}。\n"
+            "  实际看到：%s\n"
+            "  若是 electron-builder 换了输出目录名，请同步 DESKTOP_UNPACKED_DIRS。"
+            % (release, seen or "（release 目录为空或不存在）"))
+
+    unpacked = exe.parent
+    app_asar = unpacked / "resources" / "app.asar"
+    dist_index = unpacked / "resources" / "app.asar.unpacked" / "dist" / "index.html"
+    if not app_asar.is_file():
+        raise SystemExit(f"unpacked 树里没有 app.asar：{app_asar}")
+    if not dist_index.is_file():
+        # 上游 _renderer_bundle_dir(source_mode=False) 正是来这里找 renderer；
+        # 缺了它 --skip-build 启动出来是个白窗口 —— 必须当场拦下。
+        raise SystemExit(
+            f"unpacked 树里没有 renderer 产物：{dist_index}\n"
+            "  （electron-builder 的 asarUnpack 应把 dist/** 解到 app.asar.unpacked/）")
+
+    n_files = sum(1 for _ in unpacked.rglob("*"))
+    size = sum(p.stat().st_size for p in unpacked.rglob("*") if p.is_file())
+    nodes = list((unpacked / "resources" / "app.asar.unpacked").rglob("*.node"))
+    LOG(f"  ✓ {unpacked.name}: {exe.name}，{n_files} 个条目，{size / 1048576:.1f} MiB")
+    LOG(f"  · 随包的原生模块 {len(nodes)} 个"
+        + (f"（{nodes[0].name}）" if nodes else "  ⚠ 一个都没有 —— 终端面板会挂"))
+
+    # 4) 单独打 tarball。不塞进源码快照：它有 290 MiB 量级，混进 pack_repo 会让
+    #    源码包翻几倍，也不好单独校验。
+    dest.mkdir(parents=True, exist_ok=True)
+    arc = dest / DESKTOP_TARBALL_NAME
+    run(["tar", "-czf", str(arc), "-C", str(release), unpacked.name])
+    arc_mib = arc.stat().st_size / 1048576
+    LOG(f"  ✓ {arc.name}  ({arc.stat().st_size:,} B, {arc_mib:.1f} MiB)")
+    LOG("  · 目标机 `hermes desktop --skip-build` 直接启动这棵树")
+    LOG()
+    return arc
+
+
+# ---------------------------------------------------------------------------
+# 9. Playwright Chromium（arm64）
 # ---------------------------------------------------------------------------
 
 def fetch_playwright(cfg: Cfg, env: dict, browsers: Path) -> None:
@@ -812,10 +1014,10 @@ def fetch_playwright(cfg: Cfg, env: dict, browsers: Path) -> None:
     但二进制本身必须进包。
     """
     if not cfg.with_playwright:
-        LOG("── [8/11] Playwright Chromium：已按参数跳过 ──\n")
+        LOG("── [9/12] Playwright Chromium：已按参数跳过 ──\n")
         return
 
-    LOG("── [8/11] Playwright Chromium（linux-arm64）──")
+    LOG("── [9/12] Playwright Chromium（linux-arm64）──")
     browsers.mkdir(parents=True, exist_ok=True)
     stage = cfg.out / ".work" / "ms-playwright"
     stage.mkdir(parents=True, exist_ok=True)
@@ -849,7 +1051,7 @@ def fetch_playwright(cfg: Cfg, env: dict, browsers: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. 命令行工具（ripgrep / ffmpeg）
+# 10. 命令行工具（ripgrep / ffmpeg）
 # ---------------------------------------------------------------------------
 
 def fetch_media_tools(cfg: Cfg, bin_dir: Path) -> None:
@@ -859,10 +1061,10 @@ def fetch_media_tools(cfg: Cfg, bin_dir: Path) -> None:
     带 glibc 2.35 依赖，拷到 2.28 的信创机会挂。
     """
     if not cfg.with_media:
-        LOG("── [9/11] ripgrep/ffmpeg：已按参数跳过 ──\n")
+        LOG("── [10/12] ripgrep/ffmpeg：已按参数跳过 ──\n")
         return
 
-    LOG("── [9/11] ripgrep / ffmpeg（aarch64）──")
+    LOG("── [10/12] ripgrep / ffmpeg（aarch64）──")
     bin_dir.mkdir(parents=True, exist_ok=True)
     mirrors = GH_MIRRORS if cfg.gh_mirror else ()
 
@@ -907,14 +1109,14 @@ def fetch_media_tools(cfg: Cfg, bin_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. 原生扩展 fts5_cjk（CJK 分词，缺了会退化成 LIKE 全表扫）
+# 11. 原生扩展 fts5_cjk（CJK 分词，缺了会退化成 LIKE 全表扫）
 # ---------------------------------------------------------------------------
 
 def build_fts5_cjk(cfg: Cfg, out_dir: Path) -> None:
     if not cfg.with_ftscjk:
-        LOG("── [10/11] fts5_cjk：已按参数跳过 ──\n")
+        LOG("── [11/12] fts5_cjk：已按参数跳过 ──\n")
         return
-    LOG("── [10/11] 编译 fts5_cjk 原生扩展 ──")
+    LOG("── [11/12] 编译 fts5_cjk 原生扩展 ──")
     src = cfg.repo / "native" / "fts5_cjk"
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (src / "build.sh").exists():
@@ -931,7 +1133,7 @@ def build_fts5_cjk(cfg: Cfg, out_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 11. 源码树 + 清单
+# 12. 源码树 + 清单
 # ---------------------------------------------------------------------------
 
 # node_modules 必须在源码快照里排掉：它由 fetch_node_modules() 单独打成
@@ -940,7 +1142,14 @@ def build_fts5_cjk(cfg: Cfg, out_dir: Path) -> None:
 # hermes-agent-src.tar.gz 内嵌 8863 个 node_modules 文件，占了该 tarball 的
 # 绝大部分，而外层又有一份 52 MB 的 node_modules.tar.gz）。
 # 预编译 Web UI 后依赖树涨到 343 MiB，这份重复会跟着一起变贵，所以显式排掉。
-REPO_EXCLUDES = (".git", "node_modules", "website", "evals", "contributors")
+#
+# 桌面版同理且更甚：`apps/desktop/release/linux-*-unpacked/` 是 `npm run pack`
+# 的产物（Electron 运行时本身，解包 290 MiB 量级），它会**单独**打成
+# `desktop/hermes-desktop-linux-arm64.tar.gz` 进包。不排掉的话，源码快照
+# `hermes-agent-src.tar.gz` 里会再存一模一样的第二份 —— 症状同样是
+# "包莫名大了几百 MB，而日志全绿"（install.sh 只解外层那份）。
+REPO_EXCLUDES = (".git", "node_modules", "website", "evals", "contributors",
+                 "apps/desktop/release")
 
 
 def pack_repo(cfg: Cfg, dest: Path) -> None:
@@ -979,6 +1188,7 @@ def write_manifest(cfg: Cfg, bundle: Path) -> None:
             "media_tools": cfg.with_media,
             "fts5_cjk": cfg.with_ftscjk,
             "web_ui_prebuilt": cfg.with_web_ui,
+            "desktop_prebuilt": cfg.with_desktop,
         },
         "file_count": len(lines),
     }
@@ -991,7 +1201,7 @@ def write_manifest(cfg: Cfg, bundle: Path) -> None:
 def assemble_bundle(cfg: Cfg, staging: Path, runtime: Path, wheels: Path,
                     prebuilt: Path, node_modules: Path, browsers: Path,
                     media: Path, lib: Path, repo_tgz: Path,
-                    uv_bin: Path | None = None) -> Path:
+                    uv_bin: Path | None = None, desktop: Path | None = None) -> Path:
     LOG("── 组装离线包 ──")
     bundle = staging / "hermes-offline-arm64"
     if bundle.exists():
@@ -999,13 +1209,14 @@ def assemble_bundle(cfg: Cfg, staging: Path, runtime: Path, wheels: Path,
     bundle.mkdir(parents=True)
 
     for sub in ("repo", "runtime", "wheels", "wheels-prebuilt",
-                "node_modules", "browsers", "bin", "lib"):
+                "node_modules", "browsers", "bin", "lib", "desktop"):
         (bundle / sub).mkdir()
 
-    # runtime / wheels / node_modules / browsers / bin / lib：逐个文件拷
+    # runtime / wheels / node_modules / browsers / bin / lib / desktop：逐个文件拷
     for src_dir, sub in ((runtime, "runtime"), (wheels, "wheels"),
                          (prebuilt, "wheels-prebuilt"), (node_modules, "node_modules"),
-                         (browsers, "browsers"), (media, "bin"), (lib, "lib")):
+                         (browsers, "browsers"), (media, "bin"), (lib, "lib"),
+                         (desktop, "desktop")):
         if not src_dir or not src_dir.exists():
             continue
         for f in sorted(src_dir.iterdir()):
@@ -1082,9 +1293,22 @@ def build(cfg: Cfg) -> Path:
     if cfg.with_web_ui:
         build_web_ui(cfg, env)
     else:
-        LOG("── [7/11] Web UI：已按 --skip-web-ui 跳过 ──")
+        LOG("── [7/12] Web UI：已按 --skip-web-ui 跳过 ──")
         LOG("  ⚠ 目标机 `hermes dashboard` 将需要现场 npm 构建；离线环境下这是跑不通的")
         LOG()
+
+    # 桌面版也要排在 fetch_node_modules 之后：它开头那次 node-pty ABI 重建会
+    # 改写根 node_modules，而给 CLI 的那份 tarball 在 [6/12] 就已打好。
+    # 还要排在 pack_repo 之前 —— 产物虽单独成 tarball，但 pack_repo 是靠
+    # REPO_EXCLUDES 里那条 `apps/desktop/release` 把 unpacked 树挡在快照外的。
+    desktop_out: Path | None = work / "desktop"
+    if cfg.with_desktop:
+        build_desktop(cfg, env, desktop_out)
+    else:
+        LOG("── [8/12] 桌面版：已按 --skip-desktop 跳过 ──")
+        LOG("  · 目标机只能走 `hermes dashboard` + 浏览器；有图形桌面时建议别跳")
+        LOG()
+        desktop_out = None
 
     browsers = work / "browsers"
     fetch_playwright(cfg, env, browsers)
@@ -1100,7 +1324,7 @@ def build(cfg: Cfg) -> Path:
 
     bundle = assemble_bundle(cfg, cfg.out, runtime, wheels, prebuilt,
                              node_modules, browsers, media, lib, repo_tgz,
-                             uv_bin=uv_bin)
+                             uv_bin=uv_bin, desktop=desktop_out)
     write_manifest(cfg, bundle)
 
     if cfg.tarball:
@@ -1142,6 +1366,10 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--skip-web-ui", action="store_true",
                    help="不预编译 dashboard 前端。**仅用于本地快速迭代**："
                         "离线目标机没有 npm 环境，跳过后控制台打不开。")
+    p.add_argument("--skip-desktop", action="store_true",
+                   help="不打 Electron 桌面版。默认带（约 +110 MiB）："
+                        "目标机 `hermes desktop --skip-build` 开箱可用；"
+                        "若目标机没有图形桌面会话，带上它没有意义，可用此开关省掉。")
     p.add_argument("--tarball", action="store_true", help="额外产出 tar.gz")
     p.add_argument("--dry-run", action="store_true",
                    help="只跑前置自检与参数不变量，不真正构建")
@@ -1169,6 +1397,7 @@ def main(argv=None) -> int:
         with_media=not args.skip_media,
         with_ftscjk=not args.skip_fts5_cjk,
         with_web_ui=not args.skip_web_ui,
+        with_desktop=not args.skip_desktop,
         pypi_index=args.pypi_index,
         gh_mirror=args.gh_mirror,
         token=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),

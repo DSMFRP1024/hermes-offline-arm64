@@ -34,6 +34,12 @@
 #   5. Web UI（dashboard 前端）同样是**预构建**的：上游在找不到 dist 时会
 #      去跑 npm install && npm run build，这在离线机上基本必挂。构建机先把
 #      dist 编好，本脚本再补写 build stamp，`hermes dashboard` 才开箱即用。
+#   6. Hermes Desktop（Electron 桌面壳）走同一套路：构建机把整棵
+#      linux-arm64-unpacked 打成一个 tar.gz 放进 desktop/，本脚本解压到位、
+#      补写 build stamp，`hermes desktop` 才不去下载 Electron。注意 stamp
+#      里的 sourceMode 必须为 false（源码模式与打包模式的判据不同）。
+#      另：Electron 的 node-pty 必须按 Electron ABI 重编（Node 24 是 137、
+#      Electron 40 是 143），这步在构建机上做，本脚本不碰。
 # =============================================================================
 
 set -euo pipefail
@@ -60,6 +66,7 @@ PY_VERSION="3.11"
 GLIBC_MINOR_REQUIRED=28
 FORCE=false
 SKIP_BROWSER=false
+SKIP_DESKTOP=false
 VERIFY=true
 UNINSTALL=false
 INSTALL_DIR=""
@@ -67,7 +74,7 @@ HERMES_HOME="${HERMES_HOME:-}"
 ASSUME_ROOT_LAYOUT=""
 
 # --help 直接回放文件头注释（到设计要点结束为止），避免另写一份会漂移的说明。
-usage() { sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '3,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -470,9 +477,142 @@ else
 fi
 
 # =============================================================================
-# 10. 数据目录与配置模板
+# 10. Hermes Desktop（预打包的 Electron 应用，离线直接可起）
 # =============================================================================
-log_step "10. 初始化数据目录"
+log_step "10. 部署 Hermes Desktop"
+
+DESKTOP_RELEASE="$INSTALL_DIR/apps/desktop/release"
+DESKTOP_TGZ="$(ls "$BUNDLE_DIR"/desktop/*.tar.gz 2>/dev/null | head -1 || true)"
+DESKTOP_EXE=""
+
+if [ "$SKIP_DESKTOP" = true ]; then
+    log_info "已按 --skip-desktop 跳过桌面版"
+    log_info "   图形界面仍可用： hermes dashboard（浏览器打开 http://127.0.0.1:9119）"
+else
+    # 上游 main_desktop._desktop_packaged_executable_in() 认的就是这几个位置。
+    # 非 x64 架构会带 arch 后缀，arm64 上正常是 linux-arm64-unpacked。
+    for d in linux-arm64-unpacked linux-unpacked; do
+        for n in hermes Hermes; do
+            if [ -x "$DESKTOP_RELEASE/$d/$n" ]; then
+                DESKTOP_EXE="$DESKTOP_RELEASE/$d/$n"
+                break 2
+            fi
+        done
+    done
+
+    if [ -z "$DESKTOP_TGZ" ]; then
+        log_info "包内没有桌面版产物（构建时用了 --skip-desktop），跳过"
+        log_info "   图形界面仍可用： hermes dashboard（浏览器打开 http://127.0.0.1:9119）"
+    elif [ -n "$DESKTOP_EXE" ] && [ "$FORCE" != true ]; then
+        log_ok "桌面版已就位（$(basename "$(dirname "$DESKTOP_EXE")")）"
+    else
+        mkdir -p "$DESKTOP_RELEASE"
+        tar -xzf "$DESKTOP_TGZ" -C "$DESKTOP_RELEASE"
+        for d in linux-arm64-unpacked linux-unpacked; do
+            for n in hermes Hermes; do
+                if [ -x "$DESKTOP_RELEASE/$d/$n" ]; then
+                    DESKTOP_EXE="$DESKTOP_RELEASE/$d/$n"
+                    break 2
+                fi
+            done
+        done
+        if [ -z "$DESKTOP_EXE" ]; then
+            log_warn "解压后仍找不到桌面版可执行文件（$DESKTOP_RELEASE）"
+        else
+            log_ok "桌面版就位：$(basename "$(dirname "$DESKTOP_EXE")")（$(du -sm "$(dirname "$DESKTOP_EXE")" 2>/dev/null | awk '{print $1}')MB）"
+        fi
+    fi
+fi
+
+if [ -n "$DESKTOP_EXE" ]; then
+    # 可执行位：tar 会保留，但从 Windows 侧中转时可能丢，补一次
+    chmod +x "$DESKTOP_EXE" 2>/dev/null || true
+
+    # Electron 的 setuid sandbox：要么 root:4755，要么启动时加 --no-sandbox。
+    # 上游 _packaged_desktop_launch_command() 在检测到 helper 不可用时会自动
+    # 补 --no-sandbox，所以这里失败只是提示，不是错误。
+    SANDBOX_HELPER="$(dirname "$DESKTOP_EXE")/chrome-sandbox"
+    if [ -f "$SANDBOX_HELPER" ]; then
+        if chown root:root "$SANDBOX_HELPER" 2>/dev/null && chmod 4755 "$SANDBOX_HELPER" 2>/dev/null; then
+            log_ok "chrome-sandbox 已设为 setuid root"
+        else
+            log_info "chrome-sandbox 未设 setuid（非 root 执行）；启动时会自动加 --no-sandbox"
+        fi
+    fi
+
+    # 与 Web UI 同理：只有产物还不够。上游 _desktop_build_needed() 的判据是
+    # 「release 里有可执行文件」**且**「$HERMES_HOME/desktop-build-stamp.json 的
+    # sourceMode=false 且内容哈希与当前源码树一致」。那个戳不在仓库里，只能
+    # 在本机按当前源码树算一次。漏了它，裸跑 `hermes desktop` 会判定"需要构建"，
+    # 接着 npm ci + 经 @electron/get 下载 Electron 运行时 —— 离线机上必然失败。
+    STAMP_RC=0
+    HERMES_HOME="$HERMES_HOME" "$VPY" - "$INSTALL_DIR" <<'PYEOF' || STAMP_RC=$?
+import datetime, json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+try:
+    from hermes_cli.main_desktop import _compute_desktop_content_hash, _desktop_stamp_path
+    stamp = _desktop_stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(json.dumps({
+        "contentHash": _compute_desktop_content_hash(root),
+        # 必须写 false：_stamp_is_current() 会比对 sourceMode，
+        # 写成 true 的话打包模式依旧判定"需要重建"。
+        "sourceMode": False,
+        "source": "offline-bundle",
+        "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"  ✓ build stamp → {stamp}")
+except Exception as exc:
+    print(f"  ✗ 写 desktop build stamp 失败：{type(exc).__name__}: {exc}")
+    sys.exit(1)
+PYEOF
+    if [ "$STAMP_RC" -eq 0 ]; then
+        log_ok "已写入 desktop-build-stamp.json（直接启动，不会去碰 npm）"
+    else
+        log_warn "没能写入 desktop build stamp，裸 \`hermes desktop\` 可能仍会尝试重新构建"
+        log_info "   绕过办法： hermes desktop --skip-build"
+    fi
+
+    # 图形栈：Electron 要 GTK/NSS/GBM 那一套。这些库大多是 dlopen 的，
+    # ldd（下面的直接依赖）查不出来，所以额外查 ldconfig 缓存。
+    # 注意用 case 做子串匹配而不是 `ldconfig -p | grep -q`：后者命中即退出，
+    # 会让上游吃 EPIPE，在 set -o pipefail 下把结果反转成"始终缺失"。
+    LDCACHE="$(ldconfig -p 2>/dev/null || true)"
+    DESKTOP_MISSING=""
+    for lib in libgtk-3.so.0 libnss3.so libnspr4.so libatk-1.0.so.0 \
+               libatk-bridge-2.0.so.0 libatspi.so.0 libdrm.so.2 libgbm.so.1 \
+               libasound.so.2 libcups.so.2 libxkbcommon.so.0 libpango-1.0.so.0 \
+               libcairo.so.2 libXcomposite.so.1 libXdamage.so.1 libXrandr.so.2; do
+        case "$LDCACHE" in
+            *"$lib"*) ;;
+            *) DESKTOP_MISSING="$DESKTOP_MISSING $lib" ;;
+        esac
+    done
+    if [ -n "$DESKTOP_MISSING" ]; then
+        log_warn "桌面版缺少以下系统库，启动会失败："
+        printf '%s\n' $DESKTOP_MISSING | sed 's/^/      /'
+        log_info "   CentOS/openEuler/Kylin 系："
+        log_info "     sudo yum install -y gtk3 nss nspr libdrm mesa-libgbm alsa-lib atk at-spi2-core cups-libs libxkbcommon pango cairo xdg-utils"
+        log_info "   Debian/UOS 系："
+        log_info "     sudo apt install -y libgtk-3-0 libnss3 libnspr4 libdrm2 libgbm1 libasound2 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libxkbcommon0 libpango-1.0-0 libcairo2 xdg-utils"
+        log_info "   装不上也不要紧：图形界面用 hermes dashboard + 浏览器是一样的"
+    else
+        log_ok "桌面版的图形库齐全"
+    fi
+
+    # 无头机器上 Electron 起不来 —— 提前说清楚，别让用户以为是装坏了
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        log_info "当前没有图形会话（DISPLAY / WAYLAND_DISPLAY 皆为空）"
+        log_info "   桌面版必须在图形界面里运行；无头机器请改用：hermes dashboard"
+    fi
+fi
+
+# =============================================================================
+# 11. 数据目录与配置模板
+# =============================================================================
+log_step "11. 初始化数据目录"
 
 for d in cron sessions logs pairing hooks image_cache audio_cache memories skills lib bin node; do
     mkdir -p "$HERMES_HOME/$d"
@@ -499,9 +639,9 @@ mode=offline
 EOF
 
 # =============================================================================
-# 11. 命令入口
+# 12. 命令入口
 # =============================================================================
-log_step "11. 生成 hermes 命令"
+log_step "12. 生成 hermes 命令"
 
 mkdir -p "$LINK_DIR"
 
@@ -552,6 +692,13 @@ if [ -f "$WEB_DIST/index.html" ]; then
 else
     echo "  Web 控制台: 未预编译（dashboard 需现场构建，离线环境不可用）"
 fi
+if [ -n "$DESKTOP_EXE" ]; then
+    echo "  桌面应用 : hermes desktop  →  原生窗口（需要图形会话）"
+elif [ "$SKIP_DESKTOP" = true ]; then
+    echo "  桌面应用 : 已按 --skip-desktop 跳过"
+else
+    echo "  桌面应用 : 包内没有桌面版产物（重打时别加 --skip-desktop）"
+fi
 echo ""
 echo -e "${C_BOLD}接下来：${C_OFF}"
 echo "  1) 配置模型（必做）—— Hermes 只是个壳，必须接一个模型才能干活："
@@ -560,6 +707,10 @@ echo "     或直接： hermes setup"
 echo "  2) 自检：  hermes doctor"
 echo "  3) 命令行： hermes"
 echo "  4) 图形界面： hermes dashboard      （浏览器打开 http://127.0.0.1:9119）"
+if [ -n "$DESKTOP_EXE" ]; then
+echo "  5) 桌面应用： hermes desktop         （原生窗口，需要图形会话；"
+echo "               若提示要重建，用 hermes desktop --skip-build）"
+fi
 echo ""
 # 这里刻意不用 `echo "$PATH" | tr ':' '\n' | grep -qx "$LINK_DIR"`：
 # grep -q 命中即退出，会让上游 tr 吃 EPIPE；在 set -o pipefail 下整条管道

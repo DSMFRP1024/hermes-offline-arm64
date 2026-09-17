@@ -172,6 +172,43 @@ else
 fi
 rm -f "$WEB_LIST"
 
+# Hermes Desktop（Electron 桌面壳）。和 dashboard 同一个道理，但更隐蔽：
+# 上游 `hermes desktop` 找不到 unpacked 产物时会 npm ci，再让 electron-builder
+# 经 @electron/get 下载 Electron 运行时（~110 MiB）—— 离线机必失败。
+# 产物单独放在 bundle/desktop/*.tar.gz，不在源码快照里，所以直接列它。
+DESKTOP_OK=false
+DESKTOP_TGZ="$(ls "$BUNDLE_DIR"/desktop/*.tar.gz 2>/dev/null | head -1 || true)"
+DT_LIST="$(mktemp 2>/dev/null || echo "/tmp/hermes-dtlist-$$")"
+if [ -n "$DESKTOP_TGZ" ]; then
+    if tar -tzf "$DESKTOP_TGZ" > "$DT_LIST" 2>/dev/null; then
+        if grep -qE '(^|/)linux-(arm64-)?unpacked/(hermes|Hermes)$' "$DT_LIST"; then
+            D_MB="$(du -sm "$DESKTOP_TGZ" 2>/dev/null | awk '{print $1}')"
+            ok "桌面版已预打包（$(basename "$DESKTOP_TGZ")，${D_MB}MB）"
+            DESKTOP_OK=true
+            # renderer 产物要在场：缺了它 --skip-build 启动出来是个白窗口
+            if grep -qE 'app\.asar\.unpacked/dist/index\.html$' "$DT_LIST"; then
+                ok "桌面版 renderer 产物在场（app.asar.unpacked/dist/index.html）"
+            else
+                warn "桌面版 tarball 里没有 renderer 产物（app.asar.unpacked/dist/index.html）"
+            fi
+            # 随包的原生模块（node-pty）：按 Electron ABI 编好的那份
+            if grep -qE 'app\.asar\.unpacked/.*\.node$' "$DT_LIST"; then
+                ok "桌面版自带原生模块（含 node-pty）"
+            else
+                warn "桌面版 tarball 里没有 .node 原生模块 —— 内嵌终端会不可用"
+            fi
+        else
+            warn "桌面版 tarball 里没有 unpacked 可执行文件 —— 打包步骤输出目录名可能变了"
+        fi
+    else
+        warn "读不出 $(basename "$DESKTOP_TGZ")"
+    fi
+else
+    warn "包里没有桌面版产物（构建时用了 --skip-desktop）—— 只能走 hermes dashboard"
+    echo "      需要重打：构建时不要加 --skip-desktop"
+fi
+rm -f "$DT_LIST"
+
 # 依赖树是否完整。react-dom 是 web 独有的：根 node_modules 只要被"在 workspace
 # 子目录里跑 npm"剪过枝，它就会消失（见 docs/故障排查.md A10b）。拿它当代表包，
 # 既省事又直指那个失败模式。写临时文件再 grep —— 不让 tar 处在管道上游。
@@ -231,7 +268,46 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-head_ "7. 局域网内可达性（Telegram / webhook 等网关功能需要）"
+head_ "7. Hermes Desktop 的图形运行时依赖"
+if [ "$DESKTOP_OK" != true ]; then
+    echo "      （包内没有桌面版，跳过）"
+else
+    # Electron 自己带 Chromium，但系统库要宿主提供。这些库大多在启动时 dlopen，
+    # ldd 查不出来，所以查 ldconfig 缓存。注意用 case 做子串匹配而不是
+    # `ldconfig -p | grep -q`：后者命中即退出会让上游吃 EPIPE，结果被反转。
+    LDCACHE="$(ldconfig -p 2>/dev/null || true)"
+    DT_MISSING=""
+    for lib in libgtk-3.so.0 libnss3.so libnspr4.so libatk-1.0.so.0 \
+               libatk-bridge-2.0.so.0 libatspi.so.0 libdrm.so.2 libgbm.so.1 \
+               libasound.so.2 libcups.so.2 libxkbcommon.so.0 libpango-1.0.so.0 \
+               libcairo.so.2 libXcomposite.so.1 libXdamage.so.1 libXrandr.so.2; do
+        case "$LDCACHE" in
+            *"$lib"*) ;;
+            *) DT_MISSING="$DT_MISSING $lib" ;;
+        esac
+    done
+    if [ -n "$DT_MISSING" ]; then
+        warn "桌面版缺少以下系统库（启动会失败，但不影响 CLI 与 dashboard）："
+        printf '%s\n' $DT_MISSING | sed 's/^/      /'
+        echo "      CentOS/openEuler/Kylin 系："
+        echo "        sudo yum install -y gtk3 nss nspr libdrm mesa-libgbm alsa-lib atk at-spi2-core cups-libs libxkbcommon pango cairo xdg-utils"
+        echo "      Debian/UOS 系："
+        echo "        sudo apt install -y libgtk-3-0 libnss3 libnspr4 libdrm2 libgbm1 libasound2 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libxkbcommon0 libpango-1.0-0 libcairo2 xdg-utils"
+    else
+        ok "桌面版图形库齐全"
+    fi
+
+    # 无头机器上 Electron 起不来 —— 提前说清楚
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        warn "当前没有图形会话（DISPLAY / WAYLAND_DISPLAY 皆为空）"
+        echo "      桌面版必须在图形界面里运行；无头机器请改用 hermes dashboard"
+    else
+        ok "检测到图形会话（DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}）"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+head_ "8. 局域网内可达性（Telegram / webhook 等网关功能需要）"
 if command -v ip >/dev/null 2>&1; then
     ip -brief addr show 2>/dev/null | grep -v '^lo' | sed 's/^/      /' || true
 elif command -v ifconfig >/dev/null 2>&1; then

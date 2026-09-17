@@ -44,6 +44,7 @@ sudo bash install.sh
     --hermes-home /data/h    数据目录（默认 ~/.hermes，root 即 /root/.hermes）
     --force                  重建虚拟环境 / 重新解压运行时 / 重铺 node_modules
     --skip-browser           不铺 Chromium（浏览器工具不可用，其余不受影响）
+    --skip-desktop           不铺 Hermes Desktop（无图形会话时可省 ~120 MiB）
     --no-verify              跳过 MANIFEST.sha256 校验
     --uninstall              卸载（保留数据目录）
 ```
@@ -77,6 +78,9 @@ wheels/          全部 aarch64 wheel（含预构建的 sdist-only 包）
 wheels-prebuilt/ 本地构建出来的补充 wheel
 node_modules/    预构建 node_modules（含 node-pty 原生模块，目标机无需编译器）
 browsers/        Playwright Chromium（linux-arm64）
+desktop/         Hermes Desktop 的 Electron unpacked 树（tar.gz）
+                 └─ 含 renderer（app.asar.unpacked/dist）与按 Electron ABI
+                    重编的 node-pty，安装时解压到 apps/desktop/release/
 bin/             ripgrep / ffmpeg / uv
 lib/             fts5_cjk.so（中文分词检索加速）
 requirements.lock.txt  精确依赖锁（完整闭包）
@@ -99,6 +103,12 @@ MANIFEST.sha256       完整性校验清单
    但 npm registry 不可达。dashboard 前端已经预编译并配了构建戳；
    万一它仍判定"需要重建"（比如你改动了 `web/` 下的源码），
    用 `hermes dashboard --skip-build` 直接服务包内 dist。
+   桌面版（`hermes desktop`）同样已预打包并配戳，
+   兜底命令是 `hermes desktop --skip-build`。
+5. **桌面版必须在图形会话里跑** —— Electron 需要一个 X11 或 Wayland 会话
+   加上 GTK3/NSS/GBM 等系统库（这些库是启动时 `dlopen` 的，`ldd` 查不出来，
+   所以 `check-env.sh` 单独查 `ldconfig` 缓存）。缺库或没有图形会话时
+   桌面版起不来，但**不影响命令行与 `hermes dashboard`**。
 
 ---
 

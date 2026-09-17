@@ -15,6 +15,7 @@
 #   PYPI_INDEX        PyPI 镜像（境内本机可填清华源）
 #   SKIP_PLAYWRIGHT   非空则跳过 Chromium
 #   SKIP_MEDIA        非空则跳过 rg/ffmpeg
+#   SKIP_DESKTOP      非空则跳过 Hermes Desktop（Electron 桌面壳）
 #   GH_MIRROR         非空则 GitHub 资源走加速前缀
 # =============================================================================
 
@@ -100,6 +101,7 @@ ARGS=(--native --repo "$HERMES_SRC" --out "$OUT"
 [ -n "${PYPI_INDEX:-}" ] && ARGS+=(--index-url "$PYPI_INDEX")
 [ -n "${SKIP_PLAYWRIGHT:-}" ] && ARGS+=(--skip-playwright)
 [ -n "${SKIP_MEDIA:-}" ] && ARGS+=(--skip-media)
+[ -n "${SKIP_DESKTOP:-}" ] && ARGS+=(--skip-desktop)
 [ -n "${GH_MIRROR:-}" ] && ARGS+=(--gh-mirror)
 
 echo "→ 开始构建..."
