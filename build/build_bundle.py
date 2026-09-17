@@ -765,6 +765,50 @@ def _nm_tarball_filter(ti: tarfile.TarInfo):
     return ti
 
 
+def _log_tarball_composition(arc: Path, top: int = 12) -> None:
+    """列出这个 tarball 里最占体积的包 —— 让"送出去的东西值不值"可见。
+
+    为什么值得常驻：加桌面版之后根 node_modules.tar.gz 从 98.9 MB 涨到
+    234.9 MB，光看总量**猜不出来涨在哪**（本项目就猜错过一次：以为是
+    electron-builder，按名字排了一批，结果只省下 3 MB）。
+    把 top-N 打出来，下次改依赖时有人拿数据说话，而不是凭印象加黑名单。
+
+    只统计普通文件；包名取**最外层**那个 node_modules 段之后的 1~2 段
+    （`@scope/name` 算两段），这样嵌套包会归到它外层的宿主包里。
+    """
+    sizes: dict[str, int] = {}
+    try:
+        with tarfile.open(arc, "r:gz") as tf:
+            for ti in tf:
+                if not ti.isfile():
+                    continue
+                parts = ti.name.split("/")
+                key = None
+                for i, seg in enumerate(parts):
+                    if seg != "node_modules" or i + 1 >= len(parts):
+                        continue
+                    nxt = parts[i + 1]
+                    if nxt.startswith("@") and i + 2 < len(parts):
+                        key = f"{nxt}/{parts[i + 2]}"
+                    else:
+                        key = nxt
+                    break
+                if key:
+                    sizes[key] = sizes.get(key, 0) + ti.size
+    except (tarfile.TarError, OSError) as exc:
+        LOG(f"      · 体积分析跳过（{type(exc).__name__}: {exc}）")
+        return
+
+    if not sizes:
+        return
+    total = sum(sizes.values())
+    top_items = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    LOG(f"      · 共 {len(sizes)} 个包 / 未压缩 {total / 1048576:.1f} MiB；"
+        f"最大的 {len(top_items)} 个：")
+    for name, nbytes in top_items:
+        LOG(f"          {nbytes / 1048576:8.1f} MiB  {name}")
+
+
 def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     """预构建 node_modules。
 
@@ -836,7 +880,6 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
 
     # 打包成 tarball（保留符号链接与可执行位）
     made = 0
-    dropped_total = 0
     for rel in ("node_modules", "ui-tui/node_modules", "web/node_modules",
                 "apps/desktop/node_modules", "apps/shared/node_modules"):
         src = repo / rel
@@ -848,14 +891,16 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
         with tarfile.open(arc, "w:gz", compresslevel=1) as tf:
             tf.add(src, arcname=rel, filter=_nm_tarball_filter)
         made += 1
-        dropped_total += _NM_FILTER_DROPPED["bytes"]
         LOG(f"  ✓ {rel}  →  {arc.name}  ({arc.stat().st_size:,} B)")
         if _NM_FILTER_DROPPED["members"]:
-            LOG(f"      · 已排除构建期专用内容 {_NM_FILTER_DROPPED['members']:,} 个条目 / "
-                f"未压缩 {_NM_FILTER_DROPPED['bytes'] / 1048576:.1f} MiB"
-                f"（桌面版构建链，目标机用不到）")
-    if dropped_total:
-        LOG(f"  · 合计排除约 {dropped_total / 1048576:.1f} MiB 未压缩的构建期专用内容")
+            # 注意只报**条目数**，不报体积：命中的通常是**目录**成员，
+            # tarfile 一旦把该目录过滤掉就整棵子树不再遍历，而目录的 size 是 0
+            # —— 报 "0.0 MiB" 会让人以为没排掉东西，刚好读反。
+            LOG(f"      · 已剪掉 {_NM_FILTER_DROPPED['members']:,} 个构建期专用条目"
+                f"（桌面版构建链；命中的目录会连整棵子树一起跳过）")
+        # 只对最大的那棵（根 node_modules）做体积归因，别为每个 tarball 都解一遍。
+        if rel == "node_modules":
+            _log_tarball_composition(arc)
 
     if not made:
         raise SystemExit("没有产出任何 node_modules，Node 依赖安装可能整体失败了")
