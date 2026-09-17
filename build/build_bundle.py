@@ -701,6 +701,7 @@ TARGET_NM_EXCLUDES = frozenset({
     "electron",
     "electron-builder",
     "electron-builder-squirrel-windows",
+    "electron-winstaller",          # Windows 安装包（Squirrel）生成器，纯构建工具
     "app-builder-bin",
     "app-builder-lib",
     "builder-util",
@@ -718,15 +719,46 @@ TARGET_NM_EXCLUDES = frozenset({
     "@electron/windows-sign",
 })
 
+# 目标机只可能是 linux/arm64/glibc。原生模块和 napi 包会**为每个平台**带一份
+# 预编译产物，其中绝大多数在本包里永远用不到。实测（2026-09-17，根 node_modules
+# 未压缩 797.6 MiB / 1043 个包）：`node-pty` 一个包 61.6 MiB，绝大部分是
+# prebuilds 下别平台的 .node；`@rolldown/binding-linux-arm64-musl` 16.6 MiB、
+# `binding-linux-x64-gnu` 16.6 MiB —— musl / x64 变体在信创机上都是死重量。
+_TARGET_PLAT_PAIR = ("linux", "arm64")
+_FOREIGN_PLATFORM_RE = re.compile(
+    r"^(?:binding-|prebuilds-)?"
+    r"(linux|win32|darwin|freebsd|android|openbsd|netbsd|sunos|aix)-"
+    r"(x64|arm64|arm|ia32|loong64|riscv64|s390x|ppc64|ppc64le|universal)"
+    r"(?:-(gnu|musl|msvc|gnueabihf|android))?$")
+
+
+def _is_foreign_platform_name(seg: str) -> bool:
+    """`darwin-arm64` / `win32-x64-msvc` / `binding-linux-x64-gnu` 这类目录名，
+    是不是"不是我们要的 linux-arm64/glibc"。
+
+    保留：`linux-arm64`、`linux-arm64-gnu`、`binding-linux-arm64-gnu`
+    丢弃：其它平台/架构，以及 `*-musl`（信创机全是 glibc，musl 变体跑不了）
+    """
+    m = _FOREIGN_PLATFORM_RE.match(seg)
+    if not m:
+        return False
+    plat, arch, libc = m.group(1), m.group(2), m.group(3)
+    if (plat, arch) != _TARGET_PLAT_PAIR:
+        return True
+    return libc == "musl"
+
+
 # 过滤统计（每次打一个 tarball 前重置），只用于打日志 —— 让人一眼看出
 # "这次又白装了多少东西"，否则这类浪费会随着依赖变化悄悄长回来。
-_NM_FILTER_DROPPED = {"members": 0, "bytes": 0}
+# 只统计**条目数**：命中项绝大多数是目录，目录的 size 恒为 0，统计字节数
+# 只会得到 "0 B"，反而让人以为没排掉东西。
+_NM_FILTER_DROPPED = {"members": 0}
 
 
 def _nm_tarball_filter(ti: tarfile.TarInfo):
-    """打"给目标机的 node_modules"时排掉构建期才需要的东西。
+    """打"给目标机的 node_modules"时排掉构建期 / 别的平台才需要的东西。
 
-    两类，都在**打包成 tarball 时**按路径段过滤 —— 注意这是过滤 tar 成员，
+    三类，都在**打包成 tarball 时**按路径段过滤 —— 注意这是过滤 tar 成员，
     **不删盘上文件**：构建机的 node_modules 保持完整，`electron-builder`
     后续仍能拿到 `electron/dist` 去复制运行时；被剪掉的只是送出去的那一份。
 
@@ -734,6 +766,10 @@ def _nm_tarball_filter(ti: tarfile.TarInfo):
        运行时（解包 200 MiB 上下），只有 electron-builder 打包时需要。
        按路径段判断，避免误伤 `@electron/rebuild/dist` 这类含 "electron" 的路径。
     2. `TARGET_NM_EXCLUDES` 里的包 —— 桌面版构建工具链（见上面的说明）。
+    3. 别的平台的原生产物目录（见 `_is_foreign_platform_name`）——
+       `node-pty` 的 `prebuilds/`、`@rolldown/binding-*` 之类。
+       **只对目录生效**：免得某个包里恰好有个叫 `win32-x64.js` 的正常源码文件
+       被误删；而命中的目录会连整棵子树一起跳过，效果已经足够。
 
     ⚠️ 必须识别**任意层级**的 node_modules：npm 因版本冲突会把包嵌套到
     `node_modules/a/node_modules/b`，只认顶层会漏掉一大批。
@@ -745,7 +781,6 @@ def _nm_tarball_filter(ti: tarfile.TarInfo):
         i = parts.index("electron")
         if i + 1 < len(parts) and parts[i + 1] == "dist":
             _NM_FILTER_DROPPED["members"] += 1
-            _NM_FILTER_DROPPED["bytes"] += ti.size
             return None
 
     # 2) 桌面版构建工具链（含嵌套位置）
@@ -759,8 +794,14 @@ def _nm_tarball_filter(ti: tarfile.TarInfo):
             name = nxt
         if name and name in TARGET_NM_EXCLUDES:
             _NM_FILTER_DROPPED["members"] += 1
-            _NM_FILTER_DROPPED["bytes"] += ti.size
             return None
+
+    # 3) 别的平台的原生预编译目录（只剪目录）
+    if ti.isdir():
+        for seg in parts:
+            if _is_foreign_platform_name(seg):
+                _NM_FILTER_DROPPED["members"] += 1
+                return None
 
     return ti
 
@@ -887,7 +928,6 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
             continue
         arc = node_modules / (rel.replace("/", "__") + ".tar.gz")
         _NM_FILTER_DROPPED["members"] = 0
-        _NM_FILTER_DROPPED["bytes"] = 0
         with tarfile.open(arc, "w:gz", compresslevel=1) as tf:
             tf.add(src, arcname=rel, filter=_nm_tarball_filter)
         made += 1
@@ -896,8 +936,8 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
             # 注意只报**条目数**，不报体积：命中的通常是**目录**成员，
             # tarfile 一旦把该目录过滤掉就整棵子树不再遍历，而目录的 size 是 0
             # —— 报 "0.0 MiB" 会让人以为没排掉东西，刚好读反。
-            LOG(f"      · 已剪掉 {_NM_FILTER_DROPPED['members']:,} 个构建期专用条目"
-                f"（桌面版构建链；命中的目录会连整棵子树一起跳过）")
+            LOG(f"      · 已剪掉 {_NM_FILTER_DROPPED['members']:,} 个条目"
+                f"（桌面版构建链 + 别平台的原生产物；命中的目录会连整棵子树一起跳过）")
         # 只对最大的那棵（根 node_modules）做体积归因，别为每个 tarball 都解一遍。
         if rel == "node_modules":
             _log_tarball_composition(arc)

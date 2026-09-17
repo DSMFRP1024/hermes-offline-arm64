@@ -242,7 +242,7 @@ def main() -> int:
     print("\n[10] 构建期专用包必须从'给目标机的 tarball'里排掉")
     check("TARGET_NM_EXCLUDES" in build, "定义了 TARGET_NM_EXCLUDES")
     for pkg in ("electron", "electron-builder", "app-builder-bin", "builder-util",
-                "@electron/rebuild"):
+                "electron-winstaller", "@electron/rebuild"):
         check(f'"{pkg}"' in build, f"排除表含 {pkg}")
     # 反向：绝不能把 web/ui-tui 运行期要用的包排掉 —— 它们在依赖树里与构建工具共享
     mweb = re.search(r"WEB_TOOLCHAIN_REQUIRED = \(([^)]*)\)", build, re.S)
@@ -271,8 +271,30 @@ def main() -> int:
     check("if seg != \"node_modules\"" in tail,
           "识别任意层级的 node_modules（嵌套包也要排）",
           "npm 因版本冲突会把包嵌到 node_modules/a/node_modules/b，只认顶层会漏一大批")
-    check("_NM_FILTER_DROPPED" in build, "统计并打印被排除的体积",
+    check("_NM_FILTER_DROPPED" in build, "统计并打印被剪掉的条目数",
           "不报出来，这类浪费会随依赖变化悄悄长回来")
+
+    # 别的平台的预编译产物：node-pty 的 prebuilds/、@rolldown/binding-* 之类。
+    # 实测 node-pty 一个包 61.6 MiB（未压缩），绝大部分是别平台的 .node。
+    # 注意 prune_foreign_native() 的正则要求 `-<平台>-<架构>` 带前导连字符，
+    # 匹配不到 `prebuilds/win32-x64` 这种目录名 —— 所以这里必须另有一条规则。
+    print("\n[11] 别的平台的原生产物不许入包")
+    check("_is_foreign_platform_name" in build, "定义了 _is_foreign_platform_name()")
+    check('_TARGET_PLAT_PAIR = ("linux", "arm64")' in build,
+          "目标平台对写死为 linux/arm64")
+    check('libc == "musl"' in build or "musl" in build,
+          "musl 变体被排除（信创机全是 glibc）")
+    iface = build.find("def _is_foreign_platform_name(")
+    body = build[iface:iface + 900] if iface != -1 else ""
+    check("_FOREIGN_PLATFORM_RE" in body, "用一张统一的正则表判定，而不是散落的 in 判断")
+    for plat in ("win32", "darwin", "linux"):
+        check(plat in body, f"平台表含 {plat}")
+    filt = build.find("def _nm_tarball_filter(")
+    fbody = build[filt:filt + 2600] if filt != -1 else ""
+    check("if ti.isdir():" in fbody,
+          "别的平台规则**只对目录生效**",
+          "否则某个包里恰好叫 win32-x64.js 的正常源码文件会被误删")
+    check("_is_foreign_platform_name(seg)" in fbody, "过滤器真的调用了该判定")
 
     print("\n" + "-" * 64)
     if FAILS:
