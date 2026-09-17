@@ -27,7 +27,12 @@ hermes setup
 ```bash
 hermes                    # 启动交互式会话
 hermes --help             # 看全部命令
+hermes dashboard          # 启动 Web 控制台 → 浏览器打开 http://127.0.0.1:9119
 ```
+
+`hermes dashboard` 开箱即用：前端已预编译在包里，安装脚本也补写了构建戳，
+所以它**不会**去跑 `npm install`。万一提示要重建前端，加 `--skip-build`
+即可直接服务包内的 dist。
 
 ---
 
@@ -67,6 +72,7 @@ sudo bash install.sh
 install.sh / check-env.sh / README.md / docs/
 runtime/         CPython 3.11 独立运行时 + Node.js（linux-arm64）
 repo/            hermes-agent 源码（按 commit 固定的 tar.gz）
+                 └─ 内含 hermes_cli/web_dist/ —— 预编译的 dashboard 前端
 wheels/          全部 aarch64 wheel（含预构建的 sdist-only 包）
 wheels-prebuilt/ 本地构建出来的补充 wheel
 node_modules/    预构建 node_modules（含 node-pty 原生模块，目标机无需编译器）
@@ -89,6 +95,10 @@ MANIFEST.sha256       完整性校验清单
    `ModuleNotFoundError` 或安装失败体现。需要在构建时就包含。
 3. **`uv` 虽然装了但装不了任何东西** —— 放它是为了让 Hermes 的托管 uv
    检测路径短路，不去尝试联网下载 uv 本身。
+4. **目标机上不要指望重新编译任何东西** —— Node/npm 虽然都铺好了，
+   但 npm registry 不可达。dashboard 前端已经预编译并配了构建戳；
+   万一它仍判定"需要重建"（比如你改动了 `web/` 下的源码），
+   用 `hermes dashboard --skip-build` 直接服务包内 dist。
 
 ---
 

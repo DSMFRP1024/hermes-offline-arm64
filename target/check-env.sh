@@ -150,6 +150,23 @@ for b in rg ffmpeg; do
 done
 ls "$BUNDLE_DIR"/lib/*.so >/dev/null 2>&1 && ok "附带 fts5_cjk 原生扩展" || warn "没有 fts5_cjk（中文检索会变慢）"
 
+# dashboard 前端。离线机上没有 npm registry，dist 必须由包自带：
+# 否则 `hermes dashboard` 会在目标机现场 npm install → 失败 → exit 1。
+# 前端藏在嵌套的源码包里，要钻进去查；只读，用完删掉清单文件。
+WEB_LIST="$(mktemp 2>/dev/null || echo "/tmp/hermes-weblist-$$")"
+if tar -tzf "$BUNDLE_DIR/repo/hermes-agent-src.tar.gz" > "$WEB_LIST" 2>/dev/null; then
+    if grep -qxF 'hermes-agent/hermes_cli/web_dist/index.html' "$WEB_LIST"; then
+        N_WEB="$(grep -cE 'web_dist/assets/.*\.(js|css)$' "$WEB_LIST" || true)"
+        ok "dashboard 前端已预编译（web_dist/assets 有 ${N_WEB:-0} 个 js/css，离线免 npm）"
+    else
+        warn "包里没有预编译的 dashboard 前端 —— 离线环境下 Web 控制台起不来"
+        echo "      需要重打：构建时不要加 --skip-web-ui"
+    fi
+else
+    warn "读不出 repo/hermes-agent-src.tar.gz，无法确认 dashboard 前端"
+fi
+rm -f "$WEB_LIST"
+
 if [ -f "$BUNDLE_DIR/build-info.json" ]; then
     echo ""
     echo "  ── 构建信息 ──"

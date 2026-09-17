@@ -73,10 +73,14 @@ jobs:
           python3 build/check_undefined.py \
               build/build_bundle.py build/test_native_mode.py \
               build/check_undefined.py build/gh_run.py build/test_workflow.py \
-              build/push_api.py build/test_push_api.py build/test_download.py
+              build/push_api.py build/test_push_api.py build/test_download.py \
+              build/test_web_ui.py
           echo ""
           echo "── 原生模式参数不变量（锁死 pip 调用参数）──"
           python3 build/test_native_mode.py
+          echo ""
+          echo "── dashboard 前端预编译不变量（锁死离线可用的 Web UI）──"
+          python3 build/test_web_ui.py
           echo ""
           echo "── 工作流自检（YAML / run 块语法 / inputs 引用 / pipefail 陷阱）──"
           python3 build/test_workflow.py
@@ -142,7 +146,9 @@ jobs:
           # 同理 `grep -q` 也是提前退出的消费者：`tar -tzf | grep -qx` 一样
           # 会把 tar 打成 EPIPE。改成从普通文件读，就没有上游写入者了。
           LIST=$(mktemp)
-          trap 'rm -f "$LIST"' EXIT
+          REPO_TGZ=$(mktemp)
+          REPO_LIST=$(mktemp)
+          trap 'rm -f "$LIST" "$REPO_TGZ" "$REPO_LIST"' EXIT
           tar -tzf "$TB" > "$LIST"
 
           echo "── 结构抽检 ──"
@@ -186,6 +192,27 @@ jobs:
           [ "$miss" -eq 0 ] || exit 1
           echo "  ✓ 关键条目齐全"
 
+          # ── dashboard 前端必须已预编译进 repo 快照 ──
+          # 目标机是零网络信创机。上游 `hermes dashboard` 找不到 dist 时会走
+          # `_do_build_web_ui()`：先 `npm install --prefer-offline` 再 `npm run build`；
+          # 无外网时 npm install 基本必失败，随后 sys.exit(1) —— 症状是
+          # "装好了但控制台打不开"。所以 dist 必须在这里就被证实存在。
+          # web_dist 藏在嵌套的源码包里，要钻进去查。
+          tar -xzf "$TB" -O hermes-offline-arm64/repo/hermes-agent-src.tar.gz > "$REPO_TGZ"
+          tar -tzf "$REPO_TGZ" > "$REPO_LIST"
+          if ! grep -qxF 'hermes-agent/hermes_cli/web_dist/index.html' "$REPO_LIST"; then
+            echo "✗ 源码包里没有 hermes_cli/web_dist/index.html —— dashboard 前端未预编译" >&2
+            echo "  （目标机将需要现场 npm 构建，离线环境下会失败）" >&2
+            miss=1
+          fi
+          WEB_ASSETS=$(grep -cE '^hermes-agent/hermes_cli/web_dist/assets/.*\.(js|css)$' "$REPO_LIST" || true)
+          if [ "${WEB_ASSETS:-0}" -eq 0 ]; then
+            echo "✗ web_dist/assets 下没有 js/css —— 前端产物不完整" >&2
+            miss=1
+          fi
+          [ "$miss" -eq 0 ] || exit 1
+          echo "  ✓ dashboard 前端已预编译（web_dist/assets 有 $WEB_ASSETS 个 js/css）"
+
           # ── wheel 架构 / glibc 基线审计 ──
           # 这是「构建全绿、拷到信创机 GLIBC_2.XX not found」唯一能提前检出的
           # 一道闸。轮子标签是构建环境的事实记录：容器基线是 manylinux_2_28，
@@ -226,6 +253,7 @@ jobs:
             echo "| tar.gz 大小 | $SIZE |"
             echo "| 条目总数 | $N |"
             echo "| wheel 数 | $(find dist/hermes-offline-arm64 -name '*.whl' \| wc -l) |"
+            echo "| dashboard 前端 | 已预编译（hermes_cli/web_dist，离线免 npm） |"
             echo ""
             echo "构建信息："
             echo '```json'

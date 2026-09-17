@@ -31,6 +31,9 @@
 #      走 build_editable，不受该守卫影响。这也是上游 install.sh 的做法。
 #   4. node_modules 是**预构建**的：node-pty 没有 Linux 预编译包，
 #      每次安装都要 node-gyp 编译，而信创机通常没有 make/gcc。
+#   5. Web UI（dashboard 前端）同样是**预构建**的：上游在找不到 dist 时会
+#      去跑 npm install && npm run build，这在离线机上基本必挂。构建机先把
+#      dist 编好，本脚本再补写 build stamp，`hermes dashboard` 才开箱即用。
 # =============================================================================
 
 set -euo pipefail
@@ -63,7 +66,8 @@ INSTALL_DIR=""
 HERMES_HOME="${HERMES_HOME:-}"
 ASSUME_ROOT_LAYOUT=""
 
-usage() { sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+# --help 直接回放文件头注释（到设计要点结束为止），避免另写一份会漂移的说明。
+usage() { sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -419,9 +423,56 @@ done
 shopt -u nullglob
 
 # =============================================================================
-# 9. 数据目录与配置模板
+# 9. Web UI 控制台（预编译，离线直接可起）
 # =============================================================================
-log_step "9. 初始化数据目录"
+log_step "9. 部署 Web UI 控制台"
+
+WEB_DIST="$INSTALL_DIR/hermes_cli/web_dist"
+if [ -f "$WEB_DIST/index.html" ]; then
+    log_ok "预编译前端就位（$(find "$WEB_DIST" -type f | wc -l) 个文件）"
+
+    # 光有 dist 还不够。上游 _web_ui_build_needed() 的判据是
+    # 「dist 里有 index.html 或 .vite/manifest.json」**且**
+    # 「$HERMES_HOME/web-ui-build-stamp.json 的内容哈希与当前源码树一致」。
+    # 那个戳不在仓库里，只能在本机按当前源码树算一次。漏了它，裸跑
+    # `hermes dashboard` 仍会判定"需要重建"，接着去跑 npm install —— 而
+    # 离线机上 npm 取不到 registry，最终 sys.exit(1)，表现就是"控制台打不开"。
+    STAMP_RC=0
+    HERMES_HOME="$HERMES_HOME" "$VPY" - "$INSTALL_DIR" <<'PYEOF' || STAMP_RC=$?
+import datetime, json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+try:
+    from hermes_cli.main_web_build import _compute_web_ui_content_hash, _web_ui_stamp_path
+    stamp = _web_ui_stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(json.dumps({
+        "contentHash": _compute_web_ui_content_hash(root, root / "web"),
+        "source": "offline-bundle",
+        "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"  ✓ build stamp → {stamp}")
+except Exception as exc:
+    print(f"  ✗ 写 build stamp 失败：{type(exc).__name__}: {exc}")
+    sys.exit(1)
+PYEOF
+    if [ "$STAMP_RC" -eq 0 ]; then
+        log_ok "已写入 web-ui-build-stamp.json（dashboard 不会再去碰 npm）"
+    else
+        log_warn "没能写入 build stamp，裸 \`hermes dashboard\` 可能仍会尝试重建前端"
+        log_info "   绕过办法： hermes dashboard --skip-build"
+    fi
+else
+    log_warn "包里没有预编译前端（缺 $WEB_DIST/index.html）"
+    log_info "   离线机上 \`hermes dashboard\` 会自动尝试 npm 构建并失败。"
+    log_info "   请改用带前端的离线包重装（构建时不要加 --skip-web-ui）。"
+fi
+
+# =============================================================================
+# 10. 数据目录与配置模板
+# =============================================================================
+log_step "10. 初始化数据目录"
 
 for d in cron sessions logs pairing hooks image_cache audio_cache memories skills lib bin node; do
     mkdir -p "$HERMES_HOME/$d"
@@ -448,9 +499,9 @@ mode=offline
 EOF
 
 # =============================================================================
-# 10. 命令入口
+# 11. 命令入口
 # =============================================================================
-log_step "10. 生成 hermes 命令"
+log_step "11. 生成 hermes 命令"
 
 mkdir -p "$LINK_DIR"
 
@@ -496,13 +547,19 @@ echo "  代码目录 : $INSTALL_DIR"
 echo "  数据目录 : $HERMES_HOME"
 echo "  命令入口 : $LINK_DIR/hermes"
 echo "  Python   : $("$VENV/bin/python" --version 2>&1)（自带，未使用系统 Python）"
+if [ -f "$WEB_DIST/index.html" ]; then
+    echo "  Web 控制台: hermes dashboard  →  http://127.0.0.1:9119"
+else
+    echo "  Web 控制台: 未预编译（dashboard 需现场构建，离线环境不可用）"
+fi
 echo ""
 echo -e "${C_BOLD}接下来：${C_OFF}"
 echo "  1) 配置模型（必做）—— Hermes 只是个壳，必须接一个模型才能干活："
 echo "       vi $HERMES_HOME/.env"
 echo "     或直接： hermes setup"
 echo "  2) 自检：  hermes doctor"
-echo "  3) 启动：  hermes"
+echo "  3) 命令行： hermes"
+echo "  4) 图形界面： hermes dashboard      （浏览器打开 http://127.0.0.1:9119）"
 echo ""
 # 这里刻意不用 `echo "$PATH" | tr ':' '\n' | grep -qx "$LINK_DIR"`：
 # grep -q 命中即退出，会让上游 tr 吃 EPIPE；在 set -o pipefail 下整条管道

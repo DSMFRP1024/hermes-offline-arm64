@@ -224,6 +224,7 @@ class Cfg:
     with_playwright: bool = True
     with_media: bool = True          # ripgrep / ffmpeg
     with_ftscjk: bool = True
+    with_web_ui: bool = True        # dashboard 前端（离线包必须带，见 build_web_ui）
     pypi_index: str | None = None
     gh_mirror: bool = False
     token: str | None = None
@@ -299,7 +300,7 @@ def check_host_glibc_not_newer(cfg: Cfg) -> None:
 # ---------------------------------------------------------------------------
 
 def export_requirements(cfg: Cfg, uv_bin: Path, dest: Path) -> None:
-    LOG("── [1/10] 导出依赖闭包（uv export --frozen）──")
+    LOG("── [1/11] 导出依赖闭包（uv export --frozen）──")
     universal = dest / "requirements.universal.txt"
     run(
         [str(uv_bin), "export", "--frozen", "--no-emit-project",
@@ -386,7 +387,7 @@ def inventory(*dirs: Path) -> set[tuple[str, str]]:
 
 
 def fetch_wheels(cfg: Cfg, lock: Path, wheels: Path, prebuilt: Path) -> None:
-    LOG("── [2/10] 下载 wheel（aarch64 原生）──")
+    LOG("── [2/11] 下载 wheel（aarch64 原生）──")
     wheels.mkdir(parents=True, exist_ok=True)
     prebuilt.mkdir(parents=True, exist_ok=True)
 
@@ -487,7 +488,7 @@ def audit_wheels(cfg: Cfg, wheels: Path, prebuilt: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_python_runtime(cfg: Cfg, runtime: Path) -> None:
-    LOG("── [3/10] 独立 CPython 运行时（python-build-standalone）──")
+    LOG("── [3/11] 独立 CPython 运行时（python-build-standalone）──")
     runtime.mkdir(parents=True, exist_ok=True)
 
     pattern = rf"cpython-{re.escape(cfg.python_version)}\.\d+\+\d+-aarch64-unknown-linux-gnu-install_only\.tar\.gz"
@@ -507,7 +508,7 @@ def fetch_python_runtime(cfg: Cfg, runtime: Path) -> None:
 
 
 def fetch_uv(cfg: Cfg, tools: Path) -> Path:
-    LOG("── [4/10] uv（aarch64 二进制）──")
+    LOG("── [4/11] uv（aarch64 二进制）──")
     tools.mkdir(parents=True, exist_ok=True)
     mirrors = GH_MIRRORS if cfg.gh_mirror else ()
     tag, url, _ = gh_release_asset("astral-sh/uv", r"uv-aarch64-unknown-linux-gnu\.tar\.gz",
@@ -527,7 +528,7 @@ def fetch_uv(cfg: Cfg, tools: Path) -> Path:
 
 
 def fetch_node(cfg: Cfg, runtime: Path) -> Path:
-    LOG("── [5/10] Node.js（linux-arm64）──")
+    LOG("── [5/11] Node.js（linux-arm64）──")
     idx = http_json("https://nodejs.org/dist/index.json")
     lines = [cfg.node_line] + [l for l in NODE_LINES if l != cfg.node_line]
 
@@ -600,7 +601,7 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     故意排除 apps/*：那个 glob 会拉进 Electron + node-pty 的桌面链路，
     而 CLI 安装永远不会启动 Electron。
     """
-    LOG("── [6/10] 预构建 node_modules（root + ui-tui + web）──")
+    LOG("── [6/11] 预构建 node_modules（root + ui-tui + web）──")
     node_modules.mkdir(parents=True, exist_ok=True)
     repo = cfg.repo
 
@@ -679,7 +680,71 @@ def prune_foreign_native(repo: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 7. Playwright Chromium（arm64）
+# 7. Web UI 前端（dashboard 的 React/Vite SPA，必须在构建机预编译）
+# ---------------------------------------------------------------------------
+
+def build_web_ui(cfg: Cfg, env: dict) -> None:
+    """把 dashboard 前端编译好，让产物随仓库快照一起进包。
+
+    为什么非在这里编不可 ——
+    目标机是零网络信创机。上游 `hermes dashboard` 在找不到 dist 时会走
+    `_do_build_web_ui()`：先 `npm install --prefer-offline`，再 `npm run build`。
+    无外网时 npm install 基本必失败，随后 `_report_web_build_failure(..., fatal=True)`
+    直接 `sys.exit(1)` —— 症状就是"包装好了，但控制台打不开"。
+
+    所以必须在本机（有网的 arm64 容器）编好：
+      - `vite.config.ts` 里写死 `outDir: "../hermes_cli/web_dist"`（相对 web/），
+        产物因此落在仓库根的 `hermes_cli/web_dist`；
+      - 安装是 editable 的（`pip install -e .`），运行时要找的
+        `PROJECT_ROOT/hermes_cli/web_dist` 就是这个目录；
+      - `web_dist` 不在 REPO_EXCLUDES 里，会被 pack_repo() 正常收进包。
+
+    只放 dist 还不够：`_web_ui_build_needed()` 还会比对
+    `$HERMES_HOME/web-ui-build-stamp.json` 里的内容哈希，而戳**不在仓库里**。
+    那个戳由 target/install.sh 在目标机上写（见该脚本第 9 步）。
+    """
+    LOG("── [7/11] 预编译 Web UI（dashboard 前端）──")
+    web_dir = cfg.repo / "web"
+    dist = cfg.repo / "hermes_cli" / "web_dist"
+
+    if not (web_dir / "package.json").exists():
+        raise SystemExit(
+            f"{web_dir} 下没有 package.json —— 无法预编译 dashboard 前端。"
+            "上游若改了前端目录结构，这里要同步更新。")
+
+    # 用 --workspace 从仓库根调用，避免 cwd 切换影响到 npm 的 workspace 解析
+    # （web 的依赖被 hoist 到根 node_modules，cwd 不对就会找不到 vite/tsc）。
+    rc = run(["npm", "run", "build", "--workspace", "web"],
+             cwd=cfg.repo, env=env, check=False, echo=True, timeout=2400)
+    if rc != 0:
+        raise SystemExit(
+            "Web UI 预编译失败（exit=%d）。目标机没有可用的 npm 环境，"
+            "控制台会打不开 —— 这里不能放过，先修构建。" % rc)
+
+    index = dist / "index.html"
+    if not index.exists():
+        # 真出现这种情况，多半是上游改了 vite 的 outDir。与其静默产出一个
+        # "编了但运行时找不到"的包，不如当场失败并指出差异点。
+        alt = web_dir / "dist" / "index.html"
+        hint = f"（在 {alt} 发现了产物，说明上游改了 vite outDir）" if alt.exists() else ""
+        raise SystemExit(
+            f"预编译跑完了，但 {index} 不存在{hint}。"
+            "上游 `_web_dist_dir()` 只认 hermes_cli/web_dist，请同步调整本函数。")
+
+    files = [p for p in dist.rglob("*") if p.is_file()]
+    size = sum(p.stat().st_size for p in files)
+    assets = sum(1 for p in files if p.suffix in (".js", ".css"))
+    if not assets:
+        raise SystemExit(
+            f"{dist} 里有 index.html 却没有 .js/.css 资源，产物不完整。")
+    LOG(f"  ✓ hermes_cli/web_dist  ({len(files)} 个文件, {size / 1048576:.2f} MiB, "
+        f"{assets} 个 js/css)")
+    LOG("  · 目标机起 dashboard 不再需要 npm（install.sh 会补写 build stamp）")
+    LOG()
+
+
+# ---------------------------------------------------------------------------
+# 8. Playwright Chromium（arm64）
 # ---------------------------------------------------------------------------
 
 def fetch_playwright(cfg: Cfg, env: dict, browsers: Path) -> None:
@@ -693,10 +758,10 @@ def fetch_playwright(cfg: Cfg, env: dict, browsers: Path) -> None:
     但二进制本身必须进包。
     """
     if not cfg.with_playwright:
-        LOG("── [7/10] Playwright Chromium：已按参数跳过 ──\n")
+        LOG("── [8/11] Playwright Chromium：已按参数跳过 ──\n")
         return
 
-    LOG("── [7/10] Playwright Chromium（linux-arm64）──")
+    LOG("── [8/11] Playwright Chromium（linux-arm64）──")
     browsers.mkdir(parents=True, exist_ok=True)
     stage = cfg.out / ".work" / "ms-playwright"
     stage.mkdir(parents=True, exist_ok=True)
@@ -730,7 +795,7 @@ def fetch_playwright(cfg: Cfg, env: dict, browsers: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. 命令行工具（ripgrep / ffmpeg）
+# 9. 命令行工具（ripgrep / ffmpeg）
 # ---------------------------------------------------------------------------
 
 def fetch_media_tools(cfg: Cfg, bin_dir: Path) -> None:
@@ -740,10 +805,10 @@ def fetch_media_tools(cfg: Cfg, bin_dir: Path) -> None:
     带 glibc 2.35 依赖，拷到 2.28 的信创机会挂。
     """
     if not cfg.with_media:
-        LOG("── [8/10] ripgrep/ffmpeg：已按参数跳过 ──\n")
+        LOG("── [9/11] ripgrep/ffmpeg：已按参数跳过 ──\n")
         return
 
-    LOG("── [8/10] ripgrep / ffmpeg（aarch64）──")
+    LOG("── [9/11] ripgrep / ffmpeg（aarch64）──")
     bin_dir.mkdir(parents=True, exist_ok=True)
     mirrors = GH_MIRRORS if cfg.gh_mirror else ()
 
@@ -788,14 +853,14 @@ def fetch_media_tools(cfg: Cfg, bin_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. 原生扩展 fts5_cjk（CJK 分词，缺了会退化成 LIKE 全表扫）
+# 10. 原生扩展 fts5_cjk（CJK 分词，缺了会退化成 LIKE 全表扫）
 # ---------------------------------------------------------------------------
 
 def build_fts5_cjk(cfg: Cfg, out_dir: Path) -> None:
     if not cfg.with_ftscjk:
-        LOG("── [9/10] fts5_cjk：已按参数跳过 ──\n")
+        LOG("── [10/11] fts5_cjk：已按参数跳过 ──\n")
         return
-    LOG("── [9/10] 编译 fts5_cjk 原生扩展 ──")
+    LOG("── [10/11] 编译 fts5_cjk 原生扩展 ──")
     src = cfg.repo / "native" / "fts5_cjk"
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (src / "build.sh").exists():
@@ -812,7 +877,7 @@ def build_fts5_cjk(cfg: Cfg, out_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. 源码树 + 清单
+# 11. 源码树 + 清单
 # ---------------------------------------------------------------------------
 
 REPO_EXCLUDES = (".git", "website", "evals", "contributors")
@@ -853,6 +918,7 @@ def write_manifest(cfg: Cfg, bundle: Path) -> None:
             "playwright": cfg.with_playwright,
             "media_tools": cfg.with_media,
             "fts5_cjk": cfg.with_ftscjk,
+            "web_ui_prebuilt": cfg.with_web_ui,
         },
         "file_count": len(lines),
     }
@@ -951,6 +1017,15 @@ def build(cfg: Cfg) -> Path:
     node_modules = work / "node_modules"
     fetch_node_modules(cfg, env, node_modules)
 
+    # 必须排在 fetch_node_modules 之后（要用到它装出来的 vite/tsc），
+    # 且必须排在 pack_repo 之前（产物要随源码快照一起入包）。
+    if cfg.with_web_ui:
+        build_web_ui(cfg, env)
+    else:
+        LOG("── [7/11] Web UI：已按 --skip-web-ui 跳过 ──")
+        LOG("  ⚠ 目标机 `hermes dashboard` 将需要现场 npm 构建；离线环境下这是跑不通的")
+        LOG()
+
     browsers = work / "browsers"
     fetch_playwright(cfg, env, browsers)
 
@@ -1004,6 +1079,9 @@ def make_argparser() -> argparse.ArgumentParser:
     p.add_argument("--skip-playwright", action="store_true")
     p.add_argument("--skip-media", action="store_true")
     p.add_argument("--skip-fts5-cjk", action="store_true")
+    p.add_argument("--skip-web-ui", action="store_true",
+                   help="不预编译 dashboard 前端。**仅用于本地快速迭代**："
+                        "离线目标机没有 npm 环境，跳过后控制台打不开。")
     p.add_argument("--tarball", action="store_true", help="额外产出 tar.gz")
     p.add_argument("--dry-run", action="store_true",
                    help="只跑前置自检与参数不变量，不真正构建")
@@ -1030,6 +1108,7 @@ def main(argv=None) -> int:
         with_playwright=not args.skip_playwright,
         with_media=not args.skip_media,
         with_ftscjk=not args.skip_fts5_cjk,
+        with_web_ui=not args.skip_web_ui,
         pypi_index=args.pypi_index,
         gh_mirror=args.gh_mirror,
         token=os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"),
