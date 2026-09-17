@@ -44,7 +44,7 @@ sudo bash install.sh
     --hermes-home /data/h    数据目录（默认 ~/.hermes，root 即 /root/.hermes）
     --force                  重建虚拟环境 / 重新解压运行时 / 重铺 node_modules
     --skip-browser           不铺 Chromium（浏览器工具不可用，其余不受影响）
-    --skip-desktop           不铺 Hermes Desktop（无图形会话时可省 ~120 MiB）
+    --skip-desktop           不铺 Hermes Desktop（无图形会话时可省 ~140 MiB）
     --no-verify              跳过 MANIFEST.sha256 校验
     --uninstall              卸载（保留数据目录）
 ```

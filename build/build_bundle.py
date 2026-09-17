@@ -681,22 +681,87 @@ def assert_desktop_toolchain(repo: Path) -> None:
         f"react={react}）")
 
 
+# 桌面版**构建工具链**——目标机永远用不到的那一批包。
+#
+# 为什么必须显式排掉：`npm ci --workspace apps/desktop` 会把这些装进（hoist 到）
+# 根 node_modules，而根 node_modules 是要整体打成 tarball 送给目标机的。
+# 实测代价极大：加桌面版后根 node_modules.tar.gz 从 **98.9 MB 涨到 234.9 MB**
+# （+136 MB），而其中只有 ~1 MB 是运行期真需要的 —— 桌面版在目标机上跑的是
+# `desktop/` 里那棵自包含的 unpacked 树（主进程由 esbuild 打进 app.asar，
+# 原生模块在 app.asar.unpacked），**完全不碰 repo 的 node_modules**。
+#
+# 另外这批包里的 `app-builder-bin` 还夹带着 mac/win 各平台二进制，
+# 留着等于把"只发 aarch64"这条不变量破在包里（CI 只查 .whl，查不出它）。
+#
+# ⚠️ 只排**明确只服务于构建**的包。凡是 web/ui-tui/CLI 运行期可能用到的
+# （react / react-dom / vite / typescript / esbuild / semver / chalk …）一律不动 ——
+# 它们在依赖树里与这些工具共享，排错一个就是运行期炸。
+# `test_desktop.py` 有反向断言：本表不得与 WEB_TOOLCHAIN_REQUIRED 相交。
+TARGET_NM_EXCLUDES = frozenset({
+    "electron",
+    "electron-builder",
+    "electron-builder-squirrel-windows",
+    "app-builder-bin",
+    "app-builder-lib",
+    "builder-util",
+    "builder-util-runtime",
+    "dmg-builder",
+    "electron-publish",
+    "7zip-bin",
+    "@develar/schema-utils",
+    "@electron/rebuild",
+    "@electron/get",
+    "@electron/asar",
+    "@electron/notarize",
+    "@electron/osx-sign",
+    "@electron/universal",
+    "@electron/windows-sign",
+})
+
+# 过滤统计（每次打一个 tarball 前重置），只用于打日志 —— 让人一眼看出
+# "这次又白装了多少东西"，否则这类浪费会随着依赖变化悄悄长回来。
+_NM_FILTER_DROPPED = {"members": 0, "bytes": 0}
+
+
 def _nm_tarball_filter(ti: tarfile.TarInfo):
-    """打"给目标机的 node_modules"时排掉 Electron 运行时本体。
+    """打"给目标机的 node_modules"时排掉构建期才需要的东西。
 
-    `node_modules/electron/dist/` 是 @electron/get 下载后解开的那份 Chromium
-    运行时（解包 200 MiB 上下），只有 electron-builder **打包**时才需要。目标机的
-    CLI 永远不启动 Electron（桌面版用的是随 `desktop/` 单独分发、已经打包好的
-    unpacked 树），带上它纯粹白占体积。
+    两类，都在**打包成 tarball 时**按路径段过滤 —— 注意这是过滤 tar 成员，
+    **不删盘上文件**：构建机的 node_modules 保持完整，`electron-builder`
+    后续仍能拿到 `electron/dist` 去复制运行时；被剪掉的只是送出去的那一份。
 
-    只排 electron 包自己的 dist —— 按路径段判断，避免误伤
-    `@electron/rebuild/dist` 这类路径里含 "electron" 的正常产物。
+    1. `node_modules/electron/dist/` —— @electron/get 下载解开的 Chromium
+       运行时（解包 200 MiB 上下），只有 electron-builder 打包时需要。
+       按路径段判断，避免误伤 `@electron/rebuild/dist` 这类含 "electron" 的路径。
+    2. `TARGET_NM_EXCLUDES` 里的包 —— 桌面版构建工具链（见上面的说明）。
+
+    ⚠️ 必须识别**任意层级**的 node_modules：npm 因版本冲突会把包嵌套到
+    `node_modules/a/node_modules/b`，只认顶层会漏掉一大批。
     """
     parts = ti.name.split("/")
+
+    # 1) Electron 运行时本体
     if "electron" in parts:
         i = parts.index("electron")
         if i + 1 < len(parts) and parts[i + 1] == "dist":
+            _NM_FILTER_DROPPED["members"] += 1
+            _NM_FILTER_DROPPED["bytes"] += ti.size
             return None
+
+    # 2) 桌面版构建工具链（含嵌套位置）
+    for i, seg in enumerate(parts):
+        if seg != "node_modules":
+            continue
+        nxt = parts[i + 1] if i + 1 < len(parts) else ""
+        if nxt.startswith("@"):
+            name = f"{nxt}/{parts[i + 2]}" if i + 2 < len(parts) else nxt
+        else:
+            name = nxt
+        if name and name in TARGET_NM_EXCLUDES:
+            _NM_FILTER_DROPPED["members"] += 1
+            _NM_FILTER_DROPPED["bytes"] += ti.size
+            return None
+
     return ti
 
 
@@ -771,16 +836,26 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
 
     # 打包成 tarball（保留符号链接与可执行位）
     made = 0
+    dropped_total = 0
     for rel in ("node_modules", "ui-tui/node_modules", "web/node_modules",
                 "apps/desktop/node_modules", "apps/shared/node_modules"):
         src = repo / rel
         if not src.is_dir():
             continue
         arc = node_modules / (rel.replace("/", "__") + ".tar.gz")
+        _NM_FILTER_DROPPED["members"] = 0
+        _NM_FILTER_DROPPED["bytes"] = 0
         with tarfile.open(arc, "w:gz", compresslevel=1) as tf:
             tf.add(src, arcname=rel, filter=_nm_tarball_filter)
         made += 1
+        dropped_total += _NM_FILTER_DROPPED["bytes"]
         LOG(f"  ✓ {rel}  →  {arc.name}  ({arc.stat().st_size:,} B)")
+        if _NM_FILTER_DROPPED["members"]:
+            LOG(f"      · 已排除构建期专用内容 {_NM_FILTER_DROPPED['members']:,} 个条目 / "
+                f"未压缩 {_NM_FILTER_DROPPED['bytes'] / 1048576:.1f} MiB"
+                f"（桌面版构建链，目标机用不到）")
+    if dropped_total:
+        LOG(f"  · 合计排除约 {dropped_total / 1048576:.1f} MiB 未压缩的构建期专用内容")
 
     if not made:
         raise SystemExit("没有产出任何 node_modules，Node 依赖安装可能整体失败了")

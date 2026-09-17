@@ -235,6 +235,45 @@ def main() -> int:
           "断言源码快照里没有重复的 unpacked 树")
     check("桌面版" in wf, "结果摘要里体现了桌面版状态")
 
+    # ── 10. 构建期专用内容不许送给目标机 ──
+    # 实测代价：加了桌面版之后根 node_modules.tar.gz 从 98.9 MB 涨到 234.9 MB，
+    # 其中 ~1 MB 才是运行期需要的。桌面版在目标机上跑的是 desktop/ 里那棵自包含
+    # 的 unpacked 树，压根不碰 repo 的 node_modules。
+    print("\n[10] 构建期专用包必须从'给目标机的 tarball'里排掉")
+    check("TARGET_NM_EXCLUDES" in build, "定义了 TARGET_NM_EXCLUDES")
+    for pkg in ("electron", "electron-builder", "app-builder-bin", "builder-util",
+                "@electron/rebuild"):
+        check(f'"{pkg}"' in build, f"排除表含 {pkg}")
+    # 反向：绝不能把 web/ui-tui 运行期要用的包排掉 —— 它们在依赖树里与构建工具共享
+    mweb = re.search(r"WEB_TOOLCHAIN_REQUIRED = \(([^)]*)\)", build, re.S)
+    check(mweb is not None, "找得到 WEB_TOOLCHAIN_REQUIRED（用于反向断言）")
+    if mweb:
+        web_pkgs = set(re.findall(r'"([^"]+)"', mweb.group(1)))
+        mex = re.search(r"TARGET_NM_EXCLUDES = frozenset\(\{([^}]*)\}\)", build, re.S)
+        check(mex is not None, "TARGET_NM_EXCLUDES 是字面量集合（可静态解析）")
+        if mex:
+            ex_pkgs = set(re.findall(r'"([^"]+)"', mex.group(1)))
+            overlap = sorted(web_pkgs & ex_pkgs)
+            check(not overlap,
+                  "排除表与 web 构建链清单不相交",
+                  f"这些包 web 运行期要用，不能排：{overlap}")
+    # 过滤器必须是"只过滤 tar 成员"，不能删盘上文件 ——
+    # electron-builder 打包时正需要 node_modules/electron/dist。
+    fn = build.find("def _nm_tarball_filter(")
+    tail = build[fn:fn + 2200] if fn != -1 else ""
+    check(fn != -1, "定义了 _nm_tarball_filter()")
+    for danger in ("shutil.rmtree", "os.remove", "unlink", "os.unlink"):
+        check(danger not in tail,
+              f"过滤器里没有 {danger}（只过滤 tar 成员，不删盘上文件）",
+              "删了盘上副本，electron-builder 打包时就拿不到 electron/dist 了")
+    check("ti.name.split" in tail, "用路径段而不是子串匹配判断包名",
+          "子串匹配会误伤 @electron/rebuild/dist 之类")
+    check("if seg != \"node_modules\"" in tail,
+          "识别任意层级的 node_modules（嵌套包也要排）",
+          "npm 因版本冲突会把包嵌到 node_modules/a/node_modules/b，只认顶层会漏一大批")
+    check("_NM_FILTER_DROPPED" in build, "统计并打印被排除的体积",
+          "不报出来，这类浪费会随依赖变化悄悄长回来")
+
     print("\n" + "-" * 64)
     if FAILS:
         print(f"  ✗ 失败 {len(FAILS)} / 共 {CHECKS}")

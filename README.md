@@ -116,7 +116,7 @@ offline-deploy/
 │   ├── ci-entry.sh            容器内入口（CI 调用）
 │   ├── test_native_mode.py    参数不变量测试（19 项断言，CI 前置）
 │   ├── test_web_ui.py         dashboard 前端预编译不变量（39 项断言，CI 前置）
-│   ├── test_desktop.py        Hermes Desktop 预打包不变量（63 项断言，CI 前置）
+│   ├── test_desktop.py        Hermes Desktop 预打包不变量（80 项断言，CI 前置）
 │   ├── check_undefined.py     零依赖 AST 未定义名检查（CI 前置）
 │   ├── test_workflow.py       工作流自检：YAML / run 块语法 / inputs 引用 / pipefail
 │   ├── gh_run.py              查运行 / 下载 artifact / 校验离线包（多分片+续传）
@@ -163,7 +163,7 @@ hermes-offline-arm64/
 
 ---
 
-## 四个关键设计决定
+## 五个关键设计决定
 
 ### 1. 依赖清单不重新求解，而是从仓库自带的 `uv.lock` 导出
 
@@ -244,9 +244,30 @@ electron-builder → `@electron/get` 下载 Electron 运行时（约 110 MiB，
 - **戳里 `sourceMode` 必须是 `false`**。上游 `_stamp_is_current()` 会比对它，
   写成 `true` 等于没写，裸跑仍会去 npm 构建。
 
-`build/test_desktop.py`（63 项断言）把上面每一条连同调用顺序
+`build/test_desktop.py`（80 项断言）把上面每一条连同调用顺序
 （`fetch_node_modules` → `build_desktop` → `pack_repo`）、
 `REPO_EXCLUDES` 里的 `apps/desktop/release` 一起钉死。
+
+**还要把桌面版的"构建工具链"挡在包外。** `npm ci --workspace apps/desktop`
+会把 `electron` / `electron-builder` / `app-builder-bin` 这一大批（hoist 到）
+根 `node_modules`，而根 `node_modules` 是要整体打成 tarball 送给目标机的
+—— 可目标机跑的是 `desktop/` 里那棵**自包含**的 unpacked 树，压根不碰它。
+实测代价非常直观：加桌面版后根 `node_modules.tar.gz` 从 **98.9 MB 涨到
+234.9 MB**，而其中运行期真正需要的只有 ~1 MB。
+
+所以 `_nm_tarball_filter()` 在打 tarball 时按路径段排掉
+`TARGET_NM_EXCLUDES` 里那批包（`electron` / `electron-builder` /
+`app-builder-bin` / `builder-util*` / `dmg-builder` / `@electron/*`…）。
+三个要点：
+
+- **只过滤 tar 成员，不删盘上文件** —— electron-builder 打包时正需要
+  `node_modules/electron/dist`（`-c.electronDist=`），删了它就会退化成
+  走 `@electron/get` 联网下载。
+- **要认任意层级的 `node_modules`**（`node_modules/a/node_modules/b`），
+  只认顶层会漏一大批。
+- **排除表不得与 `WEB_TOOLCHAIN_REQUIRED` 相交** —— `react` / `vite` /
+  `typescript` 这些在依赖树里与构建工具共享，排错一个就是运行期炸。
+  `test_desktop.py` 里有这条反向断言。
 
 ---
 
@@ -257,12 +278,14 @@ electron-builder → `@electron/get` 下载 Electron 运行时（约 110 MiB，
 ```bash
 python build/check_undefined.py build/build_bundle.py build/test_native_mode.py \
        build/gh_run.py build/test_workflow.py build/push_api.py \
-       build/test_push_api.py build/test_download.py build/test_web_ui.py
+       build/test_push_api.py build/test_download.py build/test_web_ui.py \
+       build/test_desktop.py
 python build/test_native_mode.py
 python build/test_workflow.py
 python build/test_push_api.py
 python build/test_download.py
 python build/test_web_ui.py
+python build/test_desktop.py
 bash -n build/ci-entry.sh target/install.sh target/check-env.sh
 ```
 
@@ -296,5 +319,6 @@ bash -n build/ci-entry.sh target/install.sh target/check-env.sh
    但 GTK3/NSS/GBM/atspi 这些要宿主提供，且大多是启动时 `dlopen` 的
    （`ldd` 查不出来）—— `check-env.sh` 会查 `ldconfig` 缓存并逐个列出。
    无 X11/Wayland 会话的机器上起不来，那就用 `hermes dashboard`。
-   构建时加 `--skip-desktop`（或 CI 勾 `skip_desktop`）可以不打这一份，
-   包会小 ~120 MiB。
+   构建时加 `--skip-desktop`（或 CI 勾 `skip_desktop`）可以不打这一份 ——
+   能省下约 140 MiB（unpacked 树 343.9 MiB → tarball 135.1 MiB，
+   外加桌面版依赖给根 `node_modules` 带来的增量）。
