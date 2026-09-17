@@ -724,25 +724,43 @@ TARGET_NM_EXCLUDES = frozenset({
 # 未压缩 797.6 MiB / 1043 个包）：`node-pty` 一个包 61.6 MiB，绝大部分是
 # prebuilds 下别平台的 .node；`@rolldown/binding-linux-arm64-musl` 16.6 MiB、
 # `binding-linux-x64-gnu` 16.6 MiB —— musl / x64 变体在信创机上都是死重量。
+#
+# ⚠️ 形态有两种，**只认一种会漏掉一半**：
+#   (a) 平台在**前**，整段就是三元组 —— `prebuilds/win32-x64`、`binding-linux-arm64-gnu`；
+#   (b) 平台在**后**，整段是 `<包名>-<平台>-<架构>[-<libc>]` ——
+#       `lightningcss-linux-arm64-musl`、`@tailwindcss/oxide-linux-arm64-musl`、
+#       `@rollup/rollup-linux-arm64-gnu`、`@img/sharp-linux-x64`。
+# 第一版只写了 (a)，于是 (b) 那批（实测 8.5 + 2.5 MiB 的 musl 变体）照样入包。
+# 另外 Rust 三元组里 `darwin-unknown-arm64` 多一个 vendor 位、napi 的
+# `napi-6-darwin-unknown-arm64` 还带 napi 等级前缀，都要认。
 _TARGET_PLAT_PAIR = ("linux", "arm64")
+_PLAT_TOKENS = "linux|win32|darwin|freebsd|android|openbsd|netbsd|sunos|aix"
+_ARCH_TOKENS = "x64|arm64|arm|ia32|loong64|riscv64|s390x|ppc64|ppc64le|universal"
+# gnu / glibc 都是 glibc；musl 是另一套 libc；msvc 是 Windows 的
+_LIBC_TOKENS = "gnu|glibc|gnueabi|gnueabihf|musl|msvc|android"
+_VENDOR_TOKENS = "unknown|none|pc|apple"
 _FOREIGN_PLATFORM_RE = re.compile(
-    r"^(?:binding-|prebuilds-)?"
-    r"(linux|win32|darwin|freebsd|android|openbsd|netbsd|sunos|aix)-"
-    r"(x64|arm64|arm|ia32|loong64|riscv64|s390x|ppc64|ppc64le|universal)"
-    r"(?:-(gnu|musl|msvc|gnueabihf|android))?$")
+    r"^(?:napi-\d+-)?"                        # napi-6-darwin-unknown-arm64
+    r"(?P<pre>.*-)?"                          # lightningcss- / oxide- / rollup- / 包名前缀
+    rf"(?P<plat>{_PLAT_TOKENS})"
+    rf"(?:-(?P<vendor>{_VENDOR_TOKENS}))?"    # darwin-unknown-arm64
+    rf"-(?P<arch>{_ARCH_TOKENS})"
+    rf"(?:-(?P<libc>{_LIBC_TOKENS}))?$")
 
 
 def _is_foreign_platform_name(seg: str) -> bool:
-    """`darwin-arm64` / `win32-x64-msvc` / `binding-linux-x64-gnu` 这类目录名，
-    是不是"不是我们要的 linux-arm64/glibc"。
+    """`darwin-arm64` / `win32-x64-msvc` / `prebuilds-linux-x64` /
+    `lightningcss-linux-arm64-musl` 这类目录名，是不是"不是我们要的
+    linux-arm64/glibc"。
 
-    保留：`linux-arm64`、`linux-arm64-gnu`、`binding-linux-arm64-gnu`
-    丢弃：其它平台/架构，以及 `*-musl`（信创机全是 glibc，musl 变体跑不了）
+    保留：`linux-arm64`、`linux-arm64-gnu`、`linux-arm64-glibc`、
+      `binding-linux-arm64-gnu`、`rollup-linux-arm64-gnu`（平台在前在后都认）
+    丢弃：其它平台/架构，以及任何 `*-musl`（信创机全是 glibc，musl 跑不了）
     """
     m = _FOREIGN_PLATFORM_RE.match(seg)
     if not m:
         return False
-    plat, arch, libc = m.group(1), m.group(2), m.group(3)
+    plat, arch, libc = m.group("plat"), m.group("arch"), m.group("libc")
     if (plat, arch) != _TARGET_PLAT_PAIR:
         return True
     return libc == "musl"

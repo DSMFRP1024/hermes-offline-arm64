@@ -282,19 +282,79 @@ def main() -> int:
     check("_is_foreign_platform_name" in build, "定义了 _is_foreign_platform_name()")
     check('_TARGET_PLAT_PAIR = ("linux", "arm64")' in build,
           "目标平台对写死为 linux/arm64")
-    check('libc == "musl"' in build or "musl" in build,
+    check('libc == "musl"' in build,
           "musl 变体被排除（信创机全是 glibc）")
+    check("_PLAT_TOKENS" in build and "_ARCH_TOKENS" in build
+          and "_LIBC_TOKENS" in build,
+          "平台/架构/libc 写成可读的 token 表，而不是散落在正则里")
+    check("glibc" in build,
+          "libc 表含 glibc（`@parcel/watcher-linux-arm64-glibc` 是这种写法）")
+    check("(?P<pre>.*-)?" in build,
+          "认识「平台在**后**」的形态（`<包名>-linux-arm64-musl`）",
+          "只认平台在前会漏掉 lightningcss / @tailwindcss/oxide / rollup 那一大批")
+    check(r"(?:napi-\d+-)?" in build,
+          "认识 napi 等级前缀（`napi-6-darwin-unknown-arm64`）")
+    check("_VENDOR_TOKENS" in build,
+          "认识 Rust 三元组的 vendor 位（`darwin-unknown-arm64`）")
     iface = build.find("def _is_foreign_platform_name(")
-    body = build[iface:iface + 900] if iface != -1 else ""
+    body = build[iface:iface + 1200] if iface != -1 else ""
     check("_FOREIGN_PLATFORM_RE" in body, "用一张统一的正则表判定，而不是散落的 in 判断")
-    for plat in ("win32", "darwin", "linux"):
-        check(plat in body, f"平台表含 {plat}")
     filt = build.find("def _nm_tarball_filter(")
     fbody = build[filt:filt + 2600] if filt != -1 else ""
     check("if ti.isdir():" in fbody,
           "别的平台规则**只对目录生效**",
           "否则某个包里恰好叫 win32-x64.js 的正常源码文件会被误删")
     check("_is_foreign_platform_name(seg)" in fbody, "过滤器真的调用了该判定")
+
+    # [11] 全是"代码里有没有这段字符串"，证不了判定本身对不对。
+    # 这里把模块真的加载起来，拿**真实出现过的包名**跑一遍 —— 静态断言抓不到的
+    # 正则回溯问题（比如 `(?P<pre>.*-)?` 贪婪吞掉平台名）只有跑起来才暴露。
+    print("\n[11b] 用真实包名跑一遍判定（真加载 build_bundle）")
+    mod = None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_bb_under_test", BUILD_PY)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_bb_under_test"] = mod     # dataclass 需要它已在 sys.modules
+        spec.loader.exec_module(mod)
+    except Exception as e:                       # noqa: BLE001
+        check(False, f"加载 build_bundle 失败：{e}")
+    if mod is not None:
+        f = mod._is_foreign_platform_name
+        KEEP = [
+            "linux-arm64", "linux-arm64-gnu", "linux-arm64-glibc",
+            "binding-linux-arm64-gnu", "prebuilds-linux-arm64",
+            "rollup-linux-arm64-gnu",             # 平台在后
+            "lightningcss-linux-arm64-gnu",
+            "esbuild-linux-arm64-gnu",
+            "node-pty", "dist", "lib", "index.js", "@types", "win32.js",
+        ]
+        DROP = [
+            "win32-x64", "win32-x64-msvc", "win32-arm64", "darwin-arm64",
+            "darwin-x64", "freebsd-x64", "android-arm64",
+            "binding-linux-x64-gnu", "linux-x64", "linux-riscv64", "linux-loong64",
+            "linux-arm64-musl", "binding-linux-arm64-musl",
+            "prebuilds-linux-x64", "binding-darwin-arm64",
+            "lightningcss-linux-arm64-musl",      # 平台在后 + musl：第一版漏网
+            "rollup-linux-arm64-musl",
+            "oxide-linux-arm64-musl",
+            "watcher-linux-x64-glibc",            # glibc 但架构不对
+            "darwin-unknown-arm64",               # 带 vendor 位
+            "napi-6-darwin-unknown-arm64",        # 带 napi 等级前缀
+            "napi-9-darwin-unknown-x64",
+        ]
+        wrong_keep = [n for n in KEEP if f(n)]
+        wrong_drop = [n for n in DROP if not f(n)]
+        check(not wrong_keep, f"{len(KEEP)} 个应保留的名字全部保留",
+              f"误判为外来：{wrong_keep}")
+        check(not wrong_drop, f"{len(DROP)} 个应剪掉的名字全部命中",
+              f"漏网：{wrong_drop}")
+        check("src" not in [n for n in KEEP if f(n)],
+              "普通目录名（src/dist/lib/bin）零误伤")
+        # 与 web 运行期清单不许重叠（曾把 react / vite 误排掉）
+        overlap = set(mod.TARGET_NM_EXCLUDES) & set(mod.WEB_TOOLCHAIN_REQUIRED)
+        check(not overlap, "TARGET_NM_EXCLUDES 与 WEB_TOOLCHAIN_REQUIRED 无交集",
+              f"重叠：{overlap}")
 
     print("\n" + "-" * 64)
     if FAILS:
