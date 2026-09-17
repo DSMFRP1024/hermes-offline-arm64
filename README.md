@@ -140,6 +140,7 @@ hermes-offline-arm64/
 ├── wheels/            全部 aarch64 manylinux wheel
 ├── wheels-prebuilt/   本地预构建的 sdist-only 包
 ├── node_modules/      预构建的 node_modules（含 node-pty 原生模块）
+│                      repo/ 快照里已排除，避免整棵依赖树在包里存两遍
 ├── browsers/          Playwright Chromium（linux-arm64）
 ├── bin/               ripgrep / ffmpeg / uv
 ├── lib/               fts5_cjk.so（中文分词检索加速）
@@ -171,6 +172,23 @@ marker 劫持那一整套交叉 hack —— 那是"在错误的平台上伪装�
 `node-pty` **没有 Linux 预编译包**，每次安装都要 `node-gyp` 编译，
 而信创机通常没有 `make`/`gcc`。所以在 arm64 容器里编好再打包，
 目标机只是解压 —— 彻底消灭编译器和构建工具链依赖。
+
+它只由 `bundle/node_modules/*.tar.gz` 携带，`repo/hermes-agent-src.tar.gz`
+里**排除**了 `node_modules`（`REPO_EXCLUDES`）—— 早期漏了这项，整棵依赖树
+（预编译前端后 343 MiB）在包里存了两份。
+
+装依赖时必须**一条命令覆盖 root + ui-tui + web**：
+
+```bash
+npm ci --workspace ui-tui --workspace web --include-workspace-root
+```
+
+⚠️ 不要"顺手"再进 `ui-tui/` 补一次 `npm ci` —— `ui-tui` 没有自己的 lock，
+npm 会向上找到工作区根的 lock 并按「只含该子树」reify，把根 `node_modules` 里
+其余 workspace 的依赖**当场删掉**（`npm ci` 仍 exit 0，日志无痕）。
+这个坑的症状极具迷惑性：`tsc` 甩几百条 `TS2307`，而 `tsc` 自己照样能跑
+（`ui-tui` 的 devDependencies 里也有 `typescript`）。详见
+`docs/故障排查.md` A10b。
 
 ### 4. dashboard 前端也必须预构建
 

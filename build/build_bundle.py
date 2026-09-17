@@ -590,6 +590,42 @@ def node_env(cfg: Cfg, node_tgz: Path, work: Path) -> dict:
     return {"PATH": f"{node_dir / 'bin'}:{os.environ.get('PATH', '')}"}
 
 
+# web 构建链上"少一个就必炸"的包。挂在安装步骤后面，是为了让 npm 语义变化
+# 当场暴露，而不是等 tsc 甩几百行 TS2307 再回头猜是哪一步没装。
+WEB_TOOLCHAIN_REQUIRED = (
+    "react",
+    "react-dom",
+    "react-router",
+    "lucide-react",
+    "@nous-research/ui",
+    "vite",
+    "typescript",
+    "@vitejs/plugin-react",
+    "@tailwindcss/vite",
+)
+
+
+def assert_web_toolchain(repo: Path) -> None:
+    """确认 web 的构建依赖真的落在 node_modules 里。
+
+    npm 装没装包是**完全静默**的：缺依赖时 `npm ci` 依旧 exit 0，错误要到
+    `tsc -b` / `vite build` 才炸，而且报错行指向 `src/*.tsx`，完全指不到安装步骤。
+    （真实踩坑：整棵 web 依赖树被一次多余的 `npm ci` 剪掉，日志里毫无痕迹。）
+
+    解析顺序按 Node 的规则来：先 `web/node_modules`，再根 `node_modules`。
+    """
+    roots = [repo / "web" / "node_modules", repo / "node_modules"]
+    missing = [name for name in WEB_TOOLCHAIN_REQUIRED
+               if not any((r / name / "package.json").is_file() for r in roots)]
+    if missing:
+        raise SystemExit(
+            "web 构建依赖没有被装上：%s\n"
+            "  查收 fetch_node_modules() 里那条注释 —— 在 workspace 子目录"
+            "（ui-tui/）里跑 npm 会把根 node_modules 剪成只剩那棵子树，"
+            "web 的包会被连带删掉。" % ", ".join(missing))
+    LOG(f"  ✓ web 构建链依赖已就绪（{len(WEB_TOOLCHAIN_REQUIRED)} 个关键包）")
+
+
 def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
     """预构建 node_modules。
 
@@ -618,10 +654,28 @@ def fetch_node_modules(cfg: Cfg, env: dict, node_modules: Path) -> None:
         run(["npm", "install", *ws_args, "--no-audit", "--no-fund"],
             cwd=repo, env=env)
 
-    if (repo / "ui-tui" / "package.json").exists():
-        if run(["npm", "ci", "--no-audit", "--no-fund"], cwd=repo / "ui-tui",
-               env=env, check=False, echo=False, log_tail=30) != 0:
-            run(["npm", "install", "--no-audit", "--no-fund"], cwd=repo / "ui-tui", env=env)
+    # ⚠️ 这里**绝不能**再对 ui-tui 补一次 `npm ci` / `npm install`。
+    #
+    #    ui-tui 自己没有 package-lock.json，所以一旦在 ui-tui/ 里跑 npm，它会
+    #    **沿目录树向上**找到工作区根的那份 lock，然后按「只含 ui-tui 这棵子树」
+    #    的理想树 reify —— 而 reify 的副作用是把根 node_modules 里所有**不属于**
+    #    ui-tui 的包当场删掉，其中就包括 web 构建链要用的 react-dom /
+    #    react-router / lucide-react / @nous-research/ui。
+    #
+    #    这个坑极难从日志上看出来：删完后 `npm run build --workspace web` 会甩出
+    #    几百条 TS2307，而 `tsc` 本身照样能跑 —— 因为 ui-tui 的 devDependencies
+    #    里也有 typescript，剪枝后活了下来。症状于是伪装成"只有 web 的包丢了"。
+    #    （实测：这一步之后根 node_modules 顶层只剩一个 `ui-tui` 符号链接。）
+    #
+    #    上面那条带 --workspace 的 ci 已经覆盖 ui-tui：版本冲突的包会自动落到
+    #    ui-tui/node_modules，不需要第二次安装。
+
+    # 少装包是完全静默的（npm ci 照样 exit 0），所以这里显式验一遍再往下走。
+    nm_root = repo / "node_modules"
+    n_top = len(list(nm_root.iterdir())) if nm_root.is_dir() else 0
+    LOG(f"  · 根 node_modules 顶层 {n_top} 个条目")
+    if cfg.with_web_ui:
+        assert_web_toolchain(repo)
 
     # 清掉跨平台误装的包（在不同架构宿主上跑过之后会留下），否则目标机会 import 到错的二进制
     n_removed = prune_foreign_native(repo)
@@ -880,7 +934,13 @@ def build_fts5_cjk(cfg: Cfg, out_dir: Path) -> None:
 # 11. 源码树 + 清单
 # ---------------------------------------------------------------------------
 
-REPO_EXCLUDES = (".git", "website", "evals", "contributors")
+# node_modules 必须在源码快照里排掉：它由 fetch_node_modules() 单独打成
+# bundle/node_modules/*.tar.gz，还原由 install.sh 第 6 步负责。
+# 曾经漏了这一项 —— 于是完整依赖树在包里存了两份（实测旧包里
+# hermes-agent-src.tar.gz 内嵌 8863 个 node_modules 文件，占了该 tarball 的
+# 绝大部分，而外层又有一份 52 MB 的 node_modules.tar.gz）。
+# 预编译 Web UI 后依赖树涨到 343 MiB，这份重复会跟着一起变贵，所以显式排掉。
+REPO_EXCLUDES = (".git", "node_modules", "website", "evals", "contributors")
 
 
 def pack_repo(cfg: Cfg, dest: Path) -> None:

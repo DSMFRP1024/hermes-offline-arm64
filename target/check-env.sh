@@ -162,10 +162,34 @@ if tar -tzf "$BUNDLE_DIR/repo/hermes-agent-src.tar.gz" > "$WEB_LIST" 2>/dev/null
         warn "包里没有预编译的 dashboard 前端 —— 离线环境下 Web 控制台起不来"
         echo "      需要重打：构建时不要加 --skip-web-ui"
     fi
+    # 顺带看有没有重复携带依赖树：node_modules 只该在 bundle/node_modules/*.tar.gz 里。
+    # 正则里不用 `|`，那是 test_workflow.py 的 lint 切分管道用的字符。
+    if grep -qE '^hermes-agent/.*node_modules/' "$WEB_LIST"; then
+        warn "源码快照里混进了 node_modules —— 打包时 REPO_EXCLUDES 漏了它，白占一份空间"
+    fi
 else
     warn "读不出 repo/hermes-agent-src.tar.gz，无法确认 dashboard 前端"
 fi
 rm -f "$WEB_LIST"
+
+# 依赖树是否完整。react-dom 是 web 独有的：根 node_modules 只要被"在 workspace
+# 子目录里跑 npm"剪过枝，它就会消失（见 docs/故障排查.md A10b）。拿它当代表包，
+# 既省事又直指那个失败模式。写临时文件再 grep —— 不让 tar 处在管道上游。
+NM_TGZ="$BUNDLE_DIR/node_modules/node_modules.tar.gz"
+if [ -f "$NM_TGZ" ]; then
+    NM_LIST="$(mktemp 2>/dev/null || echo "/tmp/hermes-nmlist-$$")"
+    if tar -tzf "$NM_TGZ" > "$NM_LIST" 2>/dev/null; then
+        if grep -qxF 'node_modules/react-dom/package.json' "$NM_LIST"; then
+            ok "node_modules 依赖树完整（含 web 构建链，前端可离线重建）"
+        else
+            warn "node_modules 里缺 react-dom —— 依赖树可能被剪过枝，前端无法离线重建"
+            echo "      详见 docs/故障排查.md A10b"
+        fi
+    else
+        warn "读不出 node_modules/node_modules.tar.gz"
+    fi
+    rm -f "$NM_LIST"
+fi
 
 if [ -f "$BUNDLE_DIR/build-info.json" ]; then
     echo ""

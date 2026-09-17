@@ -18,6 +18,15 @@
      （只放 dist 不写戳，运行时仍判"需要重建"）；
   3. CI 确实断言了 web_dist/index.html 在包内。
 
+另有一条**反向**不变量同属这个主题 —— 因为预编译前端会把整棵依赖树拉进
+`node_modules`，于是"依赖树有没有被误删 / 有没有被重复打包"变得值钱：
+
+  4. `fetch_node_modules()` 里不得出现"在 workspace 子目录里再装一次 npm"
+     的写法（`ui-tui/` 那次安装会把根 `node_modules` 剪成只剩该子树，
+     web 的依赖随之消失，而 `npm ci` 依旧 exit 0）；
+  5. `node_modules` 必须待在 `REPO_EXCLUDES` 里（它另有
+     `bundle/node_modules/*.tar.gz` 一份，否则整棵树在包里存两遍）。
+
 顺带校验 install.sh 的步骤编号连续无缺号 —— 插步骤时最容易漏改号。
 
 纯静态、无网络、毫秒级，可以进 CI 前置门。
@@ -92,6 +101,37 @@ def main() -> int:
           "用 npm run build --workspace web 触发编译")
     check('"index.html"' in build, "校验了 dist/index.html 存在")
 
+    # node_modules 不进源码快照：它另有 bundle/node_modules/*.tar.gz 一份。
+    # 漏排的后果是整棵依赖树（预编译前端后 343 MiB）在包里存两遍。
+    m = re.search(r"REPO_EXCLUDES = \(([^)]*)\)", build)
+    check(m is not None, "找到 REPO_EXCLUDES 定义")
+    if m:
+        check('"node_modules"' in m.group(1),
+              "REPO_EXCLUDES 排除了 node_modules",
+              "否则 hermes-agent-src.tar.gz 会重复携带整棵依赖树")
+
+    # ── 1b. fetch_node_modules：workspace 子目录里禁止二次安装 ──
+    # 真实故障（2026-09-17）：`cwd=repo/"ui-tui"` 的 npm ci 会**沿目录树向上**
+    # 找到工作区根的 package-lock.json，然后按「只含 ui-tui 这棵子树」的理想树
+    # reify —— 副作用是把根 node_modules 里所有不属于 ui-tui 的包当场删掉，
+    # 包括 web 要用的 react-dom / lucide-react / @nous-research/ui。
+    # 症状极具迷惑性：`npm run build --workspace web` 甩出几百条 TS2307，而
+    # tsc 本身照样能跑（ui-tui 的 devDependencies 里也有 typescript，剪枝后活了下来），
+    # 于是看起来像"只有 web 的包丢了"。而且 npm ci 全程 exit 0，日志里毫无痕迹。
+    print("\n[1b] fetch_node_modules：禁止在 workspace 子目录二次安装")
+    check("def assert_web_toolchain(" in build, "定义了 assert_web_toolchain()")
+    check("assert_web_toolchain(repo)" in build,
+          "装完显式校验 web 构建链依赖（少装包是静默的）")
+    check('cwd=repo / "ui-tui"' not in build,
+          "没有在 ui-tui/ 里二次安装",
+          "它会把根 node_modules 剪成只剩 ui-tui 子树，web 的依赖随之消失")
+    check('"npm", "ci", "--no-audit", "--no-fund"' not in build,
+          "没有不带 --workspace 的 npm ci",
+          "同理会剪枝，而且会连带去装被刻意排除的 apps/*")
+    check("WEB_TOOLCHAIN_REQUIRED" in build, "web 构建链关键包清单存在")
+    for pkg in ("react-dom", "lucide-react", "@nous-research/ui", "vite", "typescript"):
+        check(f'"{pkg}"' in build, f"清单含 {pkg}")
+
     # ── 2. install.sh ──
     print("\n[2] target/install.sh")
     check("_compute_web_ui_content_hash" in install,
@@ -117,12 +157,17 @@ def main() -> int:
     print("\n[3] target/check-env.sh")
     check("web_dist/index.html" in cenv, "预检会确认前端产物在包内")
     check("--skip-web-ui" in cenv, "预检给出重打包指引")
+    check("react-dom" in cenv, "预检会体检依赖树（拿 react-dom 当代表包）")
+    check("REPO_EXCLUDES 漏了它" in cenv, "预检能发现源码快照里重复的 node_modules")
 
     # ── 4. CI 工作流 ──
     print("\n[4] .github/workflows/build-offline-bundle.yml")
     check("hermes_cli/web_dist/index.html" in wf, "校验步骤断言了 web_dist/index.html")
     check("repo/hermes-agent-src.tar.gz" in wf, "断言钻进了嵌套的源码包")
     check("dashboard 前端" in wf, "结果摘要里体现了前端状态")
+    check("node_modules/web__node_modules.tar.gz" in wf,
+          "断言三个 node_modules tarball 都在包里（唯一携带者）")
+    check("REPO_EXCLUDES 漏了它" in wf, "断言源码快照里没有重复的 node_modules")
 
     print("\n" + "-" * 64)
     if FAILS:

@@ -170,6 +170,9 @@ jobs:
           hermes-offline-arm64/bin/rg
           hermes-offline-arm64/bin/uv
           hermes-offline-arm64/runtime/NODE_CHOSEN.txt
+          hermes-offline-arm64/node_modules/node_modules.tar.gz
+          hermes-offline-arm64/node_modules/ui-tui__node_modules.tar.gz
+          hermes-offline-arm64/node_modules/web__node_modules.tar.gz
           "
           miss=0
           for must in $musts; do
@@ -212,6 +215,21 @@ jobs:
           fi
           [ "$miss" -eq 0 ] || exit 1
           echo "  ✓ dashboard 前端已预编译（web_dist/assets 有 $WEB_ASSETS 个 js/css）"
+
+          # ── 依赖树不许在源码快照里重复 ──
+          # node_modules 只由 bundle/node_modules/*.tar.gz 携带。REPO_EXCLUDES 一旦
+          # 漏了它，源码快照里会再塞进一整棵依赖树（实测 8863 个文件，占了 src
+          # tarball 的绝大部分）——包白胖一圈，装的时候还会被 install.sh 第 6 步
+          # 判定"已存在，跳过"而静默用错的那一份。
+          # 注意这里 grep 读的是普通文件（$REPO_LIST），不是管道末端，
+          # 所以不存在 pipefail 提前退出的问题。
+          # 正则里不用 `|`：那是 test_workflow.py 的 lint 切分管道用的字符。
+          if grep -qE '^hermes-agent/.*node_modules/' "$REPO_LIST"; then
+            echo "✗ 源码快照里混进了 node_modules —— REPO_EXCLUDES 漏了它" >&2
+            grep -E '^hermes-agent/.*node_modules/' "$REPO_LIST" | sed -n '1,3p' >&2
+            miss=1
+          fi
+          [ "$miss" -eq 0 ] || exit 1
 
           # ── wheel 架构 / glibc 基线审计 ──
           # 这是「构建全绿、拷到信创机 GLIBC_2.XX not found」唯一能提前检出的
