@@ -116,7 +116,7 @@ offline-deploy/
 │   ├── ci-entry.sh            容器内入口（CI 调用）
 │   ├── test_native_mode.py    参数不变量测试（19 项断言，CI 前置）
 │   ├── test_web_ui.py         dashboard 前端预编译不变量（39 项断言，CI 前置）
-│   ├── test_desktop.py        Hermes Desktop 预打包不变量（80 项断言，CI 前置）
+│   ├── test_desktop.py        Hermes Desktop 预打包不变量（90 项断言，CI 前置）
 │   ├── check_undefined.py     零依赖 AST 未定义名检查（CI 前置）
 │   ├── test_workflow.py       工作流自检：YAML / run 块语法 / inputs 引用 / pipefail
 │   ├── gh_run.py              查运行 / 下载 artifact / 校验离线包（多分片+续传）
@@ -244,21 +244,35 @@ electron-builder → `@electron/get` 下载 Electron 运行时（约 110 MiB，
 - **戳里 `sourceMode` 必须是 `false`**。上游 `_stamp_is_current()` 会比对它，
   写成 `true` 等于没写，裸跑仍会去 npm 构建。
 
-`build/test_desktop.py`（80 项断言）把上面每一条连同调用顺序
+`build/test_desktop.py`（90 项断言）把上面每一条连同调用顺序
 （`fetch_node_modules` → `build_desktop` → `pack_repo`）、
 `REPO_EXCLUDES` 里的 `apps/desktop/release` 一起钉死。
 
-**还要把桌面版的"构建工具链"挡在包外。** `npm ci --workspace apps/desktop`
-会把 `electron` / `electron-builder` / `app-builder-bin` 这一大批（hoist 到）
-根 `node_modules`，而根 `node_modules` 是要整体打成 tarball 送给目标机的
-—— 可目标机跑的是 `desktop/` 里那棵**自包含**的 unpacked 树，压根不碰它。
-实测代价非常直观：加桌面版后根 `node_modules.tar.gz` 从 **98.9 MB 涨到
-234.9 MB**，而其中运行期真正需要的只有 ~1 MB。
+**还要把两类"目标机永远用不到的东西"挡在包外。**
+
+第一类是**桌面版自己的构建工具链**：`npm ci --workspace apps/desktop` 会把
+`electron` / `electron-builder` / `app-builder-bin` 这一大批（hoist 到）根
+`node_modules`，而根 `node_modules` 是要整体打成 tarball 送给目标机的 ——
+可目标机跑的是 `desktop/` 里那棵**自包含**的 unpacked 树，压根不碰它。
+
+第二类更隐蔽，而且是**真正的大头**：**别的平台的原生预编译产物**。
+原生模块 / napi 包会为每个平台各带一份产物，而离线包只可能跑在
+linux/arm64/glibc 上。实测根 `node_modules` 未压缩 797.6 MiB / 1043 个包，
+最大的几个是 `node-pty` 61.6 MiB（绝大部分是 `prebuilds/` 下别平台的 `.node`）、
+`electron-winstaller` 30.7 MiB（Windows Squirrel 安装包生成器）、
+`@rolldown/binding-linux-arm64-musl` 16.6 MiB（musl 在 glibc 机上加载不了）。
+
+⚠️ 既有的 `prune_foreign_native()` 抓不到它们 —— 它匹配的是
+`-<平台>-<架构>` 带**前导连字符**的目录名，而 npm 生态更常见的是
+**平台在前**的 `prebuilds/win32-x64`。所以另立了
+`_is_foreign_platform_name()`，按「平台-架构[-libc]」判定：
+保留 `linux-arm64` / `linux-arm64-gnu`，丢弃其它平台、其它架构，以及所有
+`*-musl` 变体。**这条规则只对目录生效**，免得误删 `win32-x64.js` 这类源码文件。
 
 所以 `_nm_tarball_filter()` 在打 tarball 时按路径段排掉
 `TARGET_NM_EXCLUDES` 里那批包（`electron` / `electron-builder` /
-`app-builder-bin` / `builder-util*` / `dmg-builder` / `@electron/*`…）。
-三个要点：
+`electron-winstaller` / `app-builder-bin` / `builder-util*` / `dmg-builder` /
+`@electron/*`…）**和上述外来平台目录**。四个要点：
 
 - **只过滤 tar 成员，不删盘上文件** —— electron-builder 打包时正需要
   `node_modules/electron/dist`（`-c.electronDist=`），删了它就会退化成
@@ -268,6 +282,27 @@ electron-builder → `@electron/get` 下载 Electron 运行时（约 110 MiB，
 - **排除表不得与 `WEB_TOOLCHAIN_REQUIRED` 相交** —— `react` / `vite` /
   `typescript` 这些在依赖树里与构建工具共享，排错一个就是运行期炸。
   `test_desktop.py` 里有这条反向断言。
+- **过滤统计只报条目数，不报字节数** —— 命中项绝大多数是**目录**，目录成员的
+  `size` 恒为 0，报 "0.0 MiB" 会让人以为没排掉东西，**刚好读反**。
+
+> ⚠️ **别靠猜谁是体积元凶。** 这里吃过两轮白工：先把 +136 MB 归因到
+> electron-builder 构建链，加了一整张排除表**只省下 3.3 MB**。正确顺序是
+> **先加诊断再动手** —— `_log_tarball_composition()` 会把刚打出的根
+> `node_modules.tar.gz` 按顶层包名归因，打印最大的 12 个包，一眼看出真凶。
+
+修复前后（同分支实测，2026-09-17）：
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 根 `node_modules.tar.gz` | 231,580,517 B | **194,986,397 B**（−36.6 MB） |
+| 依赖树（未压缩） | 797.6 MiB / 1043 包 | **692.5 MiB / 1041 包**（−105.1 MiB） |
+| 被剪掉的条目 | — | 根 19 个 + `apps/desktop` 2 个 |
+
+> ⚠️ **别用"整包 tar.gz 大小"直接比较两轮构建。** 这里也踩过一次：
+> 修复前那轮的 **ffmpeg 下载失败**（johnvansickle 超时，属 best-effort 不致命），
+> 包里少 `ffmpeg`/`ffprobe` 两个静态二进制（gzip 后约 54 MB），
+> 于是整包反而"看起来"只小了一点点、甚至变大。**逐项对比组件大小才可信。**
+
 
 ---
 

@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -92,16 +94,37 @@ def _opener() -> urllib.request.OpenerDirector:
     )
 
 
-def api_get(path_or_url: str, token: str, timeout: float = 60.0) -> dict:
+def api_get(path_or_url: str, token: str, timeout: float = 60.0,
+            retries: int = 4) -> dict:
+    """GET 一个 GitHub API 端点。
+
+    带重试：境内走代理时 TLS 偶发 `SSLEOFError` / `ConnectionResetError`
+    （实测 watch 跑 33 秒就被一条 SSL EOF 打断，看起来像"CI 挂了"，其实
+    是代理抽了一下）。这类错误重试几乎必成，绝不能让它终止整个 watch。
+    """
     url = path_or_url if path_or_url.startswith("http") else API + path_or_url
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": UA,
-    })
-    with _opener().open(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": UA,
+        })
+        try:
+            with _opener().open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 4xx 是"我们的请求有问题"，重试没意义；5xx 与限流才值得重试。
+            if e.code < 500 and e.code != 429:
+                raise
+            last = e
+        except (urllib.error.URLError, ssl.SSLError, OSError,
+                http.client.HTTPException) as e:
+            last = e
+        if attempt < retries:
+            time.sleep(min(2.0 * attempt, 8.0))
+    raise RuntimeError(f"GitHub API 连续 {retries} 次失败：{url} —— {last}")
 
 
 def human(n: float) -> str:
