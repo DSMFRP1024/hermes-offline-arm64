@@ -185,8 +185,6 @@ jobs:
           hermes-offline-arm64/node_modules/node_modules.tar.gz
           hermes-offline-arm64/node_modules/ui-tui__node_modules.tar.gz
           hermes-offline-arm64/node_modules/web__node_modules.tar.gz
-          hermes-offline-arm64/node_modules/apps__desktop__node_modules.tar.gz
-          hermes-offline-arm64/node_modules/apps__shared__node_modules.tar.gz
           hermes-offline-arm64/desktop/hermes-desktop-linux-arm64.tar.gz
           "
           miss=0
@@ -253,6 +251,12 @@ jobs:
           fi
           [ "$miss" -eq 0 ] || exit 1
           echo "  ✓ 桌面版已预打包（unpacked 树 + renderer + $DT_NODES 个原生模块）"
+
+          # apps/*/node_modules 只在 npm 因版本冲突而嵌套时才存在；其余会被
+          # hoist 到根 node_modules，由 node_modules.tar.gz 统一携带。所以
+          # 这里只报个数，不做硬断言 —— 为 0 不等于出错。
+          APPS_NM=$(grep -cE '^hermes-offline-arm64/node_modules/apps__.*\.tar\.gz$' "$LIST" || true)
+          echo "  · 桌面版链路的嵌套 node_modules tarball: ${APPS_NM:-0} 个（0 = 全被 hoist 到根，正常）"
 
           # ── 依赖树不许在源码快照里重复 ──
           # node_modules 只由 bundle/node_modules/*.tar.gz 携带。REPO_EXCLUDES 一旦
