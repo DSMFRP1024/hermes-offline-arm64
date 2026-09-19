@@ -62,7 +62,8 @@ jobs:
           echo "── AST 未定义名检查 ──"
           python3 build/check_undefined.py \
               build/build_extras.py build/test_extras.py build/check_undefined.py \
-              build/test_workflow.py build/smoke_pack.py
+              build/test_workflow.py build/smoke_pack.py \
+              build/verify_extras_tarball.py
           echo ""
           echo "── 增强包不变量 ──"
           python3 build/test_extras.py
@@ -242,6 +243,14 @@ jobs:
 
           # ── 脚本必须有执行位（tar 里强制过 0755，这里再确认一次）──
           tar -tvzf "$TB" > /dev/null 2>&1 || { echo "✗ tar 无法读取" >&2; exit 1; }
+
+          # ── 权威体检：产物侧的唯一裁判（MANIFEST 逐字节、符号链接自洽、
+          #    离线纯度、轮子审计、build-info 自洽……）──
+          # 这一道是打完包**立刻**验，不要在"下载回来才发现不对劲"时才暴露。
+          # 它拦过两个真实 bug：MANIFEST 把 npm 符号链接按目标内容登记、
+          # build-info.json 生成顺序晚于 MANIFEST 导致自己进不了清单。
+          echo ""
+          python3 build/verify_extras_tarball.py "$TB"
 
           SHA=$(sha256sum "$TB" | awk '{print $1}')
           SIZE=$(du -h "$TB" | cut -f1)

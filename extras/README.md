@@ -249,10 +249,14 @@ sudo bash <主包目录>/install.sh --force
 ```bash
 # 本地静态门（都在拉镜像之前跑，秒级）
 python3 build/check_undefined.py build/build_extras.py build/test_extras.py \
-    build/check_undefined.py build/test_workflow.py build/smoke_pack.py
-python3 build/test_extras.py      # 126 项不变量（含 argparse 字段门 + 反向验证）
+    build/check_undefined.py build/test_workflow.py build/smoke_pack.py \
+    build/verify_extras_tarball.py
+python3 build/test_extras.py      # 161 项不变量（含 argparse 字段门 + 反向验证）
 python3 build/smoke_pack.py       # pack 端到端冒烟（合成最小树，不需要网络）
 python3 build/test_workflow.py    # 需要 PyYAML
+
+# 产物侧体检（CI 打完包就跑；本地下载回来也跑一遍，同一份规则）
+python3 build/verify_extras_tarball.py dist/hermes-extras-offline-arm64.tar.gz
 
 # 出包（GitHub Actions）
 gh workflow run build-extras.yml -f lean=false
@@ -267,13 +271,69 @@ argparse 一声不吭，直到真跑到那一步才 `AttributeError`。
 真实案例：`pack` 阶段读 `args.index`（`--index` 只挂在 `wheels` 上），
 前面六步全绿，白烧一轮十几分钟的 CI。
 
+`verify_extras_tarball.py` 是**产物侧的唯一裁判**，流式读 tar、不解包。
+它拦过两个真 bug —— 两个都是 `stage_pack()` 的语义/顺序问题，
+而 `smoke_pack.py` 当时**拦不住**（因为它只看"跑通没跑通"，不看清单语义）：
+
+| bug | 现象 | 根因 |
+|---|---|---|
+| MANIFEST 登记了符号链接 | 体检同时报「sha256 对不上」+「文件缺失」，各 4 个（`node_modules/.bin/mcp-server-*`、`node-which`） | `Path.is_file()` 会**跟随**链接，于是按"目标内容"给链接算了哈希；tar 存的是 symlink 条目，读不到内容。目标机 `sha256sum -c` 会报可疑告警 |
+| build-info.json 没登记 | 「1 个文件没登记，例如 `['build-info.json']`」 | 它排在 MANIFEST **之后**生成，自己进不了清单 |
+
+修法：MANIFEST 只登记普通文件（符号链接跳过 —— 链接目标本来就是普通文件，
+各自已入册，**不损失覆盖**），且 `build-info.json` 先写、MANIFEST 后写。
+符号链接本身由体检单独把关：必须是相对路径、不悬空、目标已入册。
+运行时也不依赖那些垫片 —— `install-extras.sh` 是用 `node <dist/index.js>`
+起 Node MCP 服务器的，走不到 `.bin/`。
+
+体检脚本自己的规则也踩过一个坑：第一版用裸子串找 `pip install` 判"是否联网"，
+把 `log_ok "... 离线 pip install 可直接取"` 这句**提示语**误判成联网动作。
+现在只认真正的调用行（含 `-m pip`，或行首是 `pip`/`pip3`），
+并且把 `\` 续行接成逻辑行后再判（`--no-index` 常写在续行上）。
+
+**这个冒烟必须与 CI 同形**——第二轮的教训（CI run 35415356313）就是栽在这：
+`stage_pack()` 里只写了 `dest = Path(args.out)`，而 `resolve_node_entry()`
+返回的是 `.resolve()` 过的**绝对**路径；CI 传的 `--out` 却是相对的
+（`dist/hermes-extras-offline-arm64`），于是
+
+```
+ValueError: '.../mcp-node/node_modules/@modelcontextprotocol/.../index.js'
+            is not in the subpath of 'dist/hermes-extras-offline-arm64/mcp-node'
+```
+
+第一版冒烟之所以漏过，是因为它**传的是绝对路径、而且没传 `--node-src`**，
+`resolve_node_entry` + `relative_to` 那条路径一次都没被执行。
+所以现在 `smoke_pack.py` 硬性做到这些（`test_extras.py` 逐条守住）：
+
+1. 造真的 `node_modules`（`bin` 指向**嵌套**的 `dist/index.js`，专门踩 `relative_to`），
+   并造出 `.bin/` 里的**符号链接**（npm 真实产物形态）；
+2. **「全相对（＝CI 同形）/ 全绝对」两种传参各跑一遍**，都必须通过；
+3. 断言产物结构：`mcp-servers.json` 的 node 段、入口文件、版本、MANIFEST 路径，
+   并直接开 tar 比对「MANIFEST 登记的每个条目在包里都是**普通文件**」；
+4. 三处**反向验证**，各自都要能证明"规则是活的"：
+   - 拿掉三处 `.resolve()`（植回 bug #2）→ 必须失败，且原因必须是 `relative_to`；
+   - 手工构造坏树/好树（`TarInfo(type=SYMTYPE)`，**与宿主无关**）→
+     体检必须报「MANIFEST 登记了符号链接」，且不误判好树；
+   - 拿掉「清单跳过符号链接」（植回 bug #3）→ 体检必须报出来。
+
+> 为什么符号链接那条要用**手工构造**的 tar 成员：Windows 非管理员执行
+> `os.symlink` 会 `WinError 1314`，靠宿主建链接会让这条测试在本机**静默变成假通过**。
+> 生成本机建不了链接时，冒烟会打印一行 `! …降级…`，由 CI 的 Linux runner 覆盖全长；
+> 但上面第 4 条里的两个"体检反向验证"是与宿主无关的，**任何平台都真跑**。
+
+写测试时的通用教训：**夹具的传参形态要跟 CI 一致**（相对/绝对、是否传可选参数），
+否则"通过"只说明你没测到那条路。凡是"只在某个分支才走到"的代码，
+冒烟里都要有东西逼它走进去。更进一步：**别让夹具依赖宿主的特权**
+（符号链接、执行位、权限位），否则"通过"会在本机变成谎话，只在 CI 才现原形。
+
 构建分三步，缺一不可：
 
 1. **`manylinux_2_28_aarch64` 容器里下轮子** —— 容器同时提供 glibc 2.28 基线和
    cp311，所以 pip 求值出来的就是信创机要的那一份。**只用 arm64 runner 会产出
    链接到 glibc 2.39 的轮子**，装机报 `GLIBC_2.39 not found`，而构建日志全绿。
 2. **arm64 runner 上原生 `npm install`** —— 目标机零网络，依赖树必须预装好。
-3. **打包** —— 生成 lock、MANIFEST.sha256、build-info.json，再打 tar.gz。
+3. **打包** —— 生成 lock、build-info.json、MANIFEST.sha256，再打 tar.gz
+   （顺序有讲究：build-info 必须在 MANIFEST 之前，否则它自己进不了清单）。
 
 ### 触发与取构建日志（国内网络）
 

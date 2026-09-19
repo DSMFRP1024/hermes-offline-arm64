@@ -520,6 +520,9 @@ def main() -> int:
         check("build/smoke_pack.py" in wf,
               "把 pack 端到端冒烟挂进了 CI",
               "pack 冒烟没挂进 CI —— 「子命令缺选项」这类问题就只能到 CI 才暴露")
+        check("build/verify_extras_tarball.py" in wf,
+              "打完包立刻跑产物侧体检（同一份规则，别等下载回来才发现）",
+              "CI 没跑 verify_extras_tarball.py —— 产物语义问题会漏到交付环节")
         check("chown" in wf,
               "容器跑完后 chown dist（否则 runner 写不进打包产物）",
               "没有 chown dist —— 容器以 root 落盘，后续 runner 步骤会 Permission denied")
@@ -565,6 +568,113 @@ def main() -> int:
         check("self_test_root_cause" in sps,
               "冒烟内置反向验证（植回 bug 必须被抓）",
               "冒烟没有自证 —— 「通过」可能只是没执行到那条路径")
+
+    # ── 8.5 MANIFEST 的语义与顺序（交付前体检踩出来的两个真 bug）──
+    # ① npm 的 node_modules/.bin/* 是符号链接，而 `Path.is_file()` 会**跟随**链接，
+    #    于是 MANIFEST 按"目标内容"给链接算了哈希；tar 存的是 symlink 条目，
+    #    校验方按链接读不到内容 → 同时报"sha256 对不上"和"文件缺失"。
+    # ② build-info.json 若排在 MANIFEST 之后生成，它自己进不了清单 → "1 个文件没登记"。
+    if bb.is_file():
+        src = read(bb)
+        i = src.find("def _manifest_files(")
+        mf_body = src[i:i + 1200] if i >= 0 else ""
+        check("not p.is_symlink()" in mf_body,
+              "MANIFEST 只登记普通文件（跳过符号链接）",
+              "MANIFEST 生成时没跳过符号链接 —— Path.is_file() 会跟随链接，"
+              "npm 的 .bin/* 会被按目标内容登记，目标机 sha256sum -c 报可疑告警")
+        j = src.find("def stage_pack(")
+        pack_body = src[j:] if j >= 0 else ""
+        k_info = pack_body.find("生成 build-info.json")
+        k_man = pack_body.find("生成 MANIFEST.sha256")
+        check(0 <= k_info < k_man,
+              "build-info.json 先于 MANIFEST 生成（它自己也能入册）",
+              f"build-info 在 MANIFEST 之后（{k_info} vs {k_man}）—— "
+              "它自己会漏在清单外，体检报「1 个文件没登记」")
+        check("_write_info(dest, info)" in pack_body,
+              "build-info 通过 _write_info 统一落盘",
+              "没有 _write_info —— 两份写法容易漂移")
+        check("symlinks" in pack_body,
+              "build-info 记录了符号链接数（体检据此对账）",
+              "build-info 没记符号链接数")
+
+    # ── 8.6 产物侧体检脚本 ──
+    print("\n· build/verify_extras_tarball.py")
+    vf = BUILD / "verify_extras_tarball.py"
+    check(vf.is_file(), "存在（产物侧的唯一裁判）",
+          "不存在 —— 打包侧的语义问题就没有权威裁判，只能等下载完才发现")
+    if vf.is_file():
+        check_lf(vf)
+        vsrc = read(vf)
+        try:
+            tree = ast.parse(vsrc)
+            mods: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    mods |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    mods.add(node.module.split(".")[0])
+            third = mods - {"argparse", "hashlib", "json", "re", "sys", "tarfile",
+                            "pathlib", "__future__"}
+            check(not third,
+                  "只用标准库（CI 里 python3 裸跑即可，不用装任何东西）",
+                  f"引入了第三方库：{sorted(third)}")
+        except SyntaxError as exc:
+            check(False, "", f"verify_extras_tarball.py 语法错误：{exc}")
+        # 关键规则必须在，且 pip 判定不能靠裸子串（第一版就把提示语里的
+        # "pip install" 误判成联网动作）
+        for needle, what in (
+            ("MANIFEST 登记了符号链接", "把「清单登记了符号链接」判为失败"),
+            ("所有链接的目标都在 MANIFEST 里", "校验符号链接目标已入册"),
+            ("每个 pip 调用都带 --no-index", "校验每个 pip 调用都离线"),
+            ("if \"-m pip\" not in s", "pip 判定锚在真正的调用行上（不误判提示语）"),
+            ("BANNED_SUBSTR", "排除 onnxruntime / magika 之类的重物"),
+            ("NEVER_CMD", "禁止 npx / uvx / npm install / pip download"),
+        ):
+            check(needle in vsrc, f"体检脚本会{what}", f"体检脚本缺规则：{what}")
+
+    sp = BUILD / "smoke_pack.py"
+    check(sp.is_file(), "build/smoke_pack.py 存在（pack 的端到端兜底）",
+          "build/smoke_pack.py 不存在 —— pack 阶段就只能靠 CI 才能验到")
+    if sp.is_file():
+        check_lf(sp)
+        try:
+            ast.parse(read(sp))
+            check(True, "smoke_pack.py 语法 OK", "")
+        except SyntaxError as exc:
+            check(False, "", f"smoke_pack.py 语法错误：{exc}")
+
+        # 「测试必须与 CI 同形」本身也要被守住 —— bug #2 就是因为冒烟传了绝对
+        # 路径、又没给 --node-src，出错的代码路径一次都没跑到。
+        sps = read(sp)
+        check("--node-src" in sps,
+              "冒烟传了 --node-src（覆盖 Node 入口解析）",
+              "冒烟没传 --node-src —— resolve_node_entry/relative_to 那条路径"
+              "不会被跑到，CI run 35415356363 就是这么漏过去的")
+        check("build_node_fixture" in sps,
+              "冒烟造了真的 node_modules（bin 指向嵌套入口）",
+              "冒烟没造 node_modules —— Node 分支形同虚设")
+        check("os.symlink" in sps,
+              "冒烟夹具造了 .bin 符号链接（npm 真实产物形态）",
+              "夹具没有符号链接 —— MANIFEST 那条规则就没被真跑过")
+        check("WinError" in sps or "建不了符号链接" in sps,
+              "建不了链接时明确降级并说明由 CI 覆盖",
+              "没处理「宿主建不了符号链接」—— 本机会静默变成假通过")
+        check("relative=True" in sps and "relative=False" in sps,
+              "冒烟对「相对 / 绝对」两种传参各跑一遍",
+              "冒烟只跑一种传参 —— 绝对/相对混用这类 bug 会漏")
+        check("self_test_root_cause" in sps,
+              "冒烟内置反向验证（植回 bug 必须被抓）",
+              "冒烟没有自证 —— 「通过」可能只是没执行到那条路径")
+        check("self_test_verifier" in sps,
+              "冒烟反向验证体检脚本本身（构造坏树/好树）",
+              "没有验证体检脚本 —— 规则写错了也没人知道")
+        check("self_test_symlink_skip" in sps,
+              "冒烟反向验证「清单跳过符号链接」这条修复",
+              "没有这条自证 —— 修复被回退时没人拦")
+        # 体检必须校验「清单条目在 tar 里都是普通文件」
+        check("MANIFEST 登记了" in sps and "reg" in sps,
+              "冒烟直接比对 MANIFEST 与 tar 成员类型",
+              "冒烟没比对 tar 成员类型 —— 符号链接问题只能靠体检脚本间接兜")
 
     # stage_pack 的路径归一：resolve_node_entry() 返回绝对路径，CLI 传的却
     # 可能是相对路径，不归一就 relative_to 崩。这是 bug #2 的正面钉死。

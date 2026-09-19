@@ -370,6 +370,12 @@ def resolve_node_entry(root: Path, pkg: str) -> tuple[Path, str]:
     return path, str(meta.get("version", ""))
 
 
+def _write_info(dest: Path, info: dict) -> None:
+    """落 build-info.json（stage_pack 里会写不止一次，集中一处免得两份格式漂移）。"""
+    (dest / "build-info.json").write_text(
+        json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def stage_pack(args: argparse.Namespace) -> int:
     # ⚠️ 三个根目录一律先 resolve() 成绝对路径。
     #
@@ -446,24 +452,38 @@ def stage_pack(args: argparse.Namespace) -> int:
     (dest / "mcp-servers.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    # ── 4) 清单 ──
-    hr("生成 MANIFEST.sha256")
-    lines = []
-    for p in sorted(dest.rglob("*")):
-        if p.is_file() and p.name != "MANIFEST.sha256":
-            h = hashlib.sha256(p.read_bytes()).hexdigest()
-            lines.append(f"{h}  {p.relative_to(dest).as_posix()}")
-    (dest / "MANIFEST.sha256").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    log(f"  ✓ {len(lines)} 个文件已登记")
-
-    # ── 5) build-info.json ──
+    # ── 4) build-info.json ──
+    #
+    # ⚠️ 必须排在 MANIFEST **之前**：反过来的话 build-info.json 自己进不了清单，
+    # 交付前体检会报"1 个文件没登记，例如 ['build-info.json']"（实测发现的）。
+    hr("生成 build-info.json")
     build = manifest.get("build", {})
+
+    def _manifest_files() -> list[Path]:
+        """该进 MANIFEST 的文件：普通文件，跳过符号链接与 MANIFEST 自己。
+
+        ⚠️ 必须跳过符号链接 —— `Path.is_file()` 会**跟随**链接，于是
+        `node_modules/.bin/*` 这些 npm 垫片会被按"目标文件的内容"算哈希，
+        而 tar 把它们存成 symlink 条目；校验方按 symlink 读不到内容，
+        于是同时报"sha256 对不上"和"文件缺失"（实测 4 个：3 个
+        mcp-server-* 垫片 + node-which）。
+
+        跳掉不损失覆盖：链接目标本身是普通文件，各自已在清单里；
+        而且运行时根本不走这些垫片 —— install-extras.sh 是用
+        `node <dist/index.js>` 起 Node MCP 服务器的。
+        """
+        return [p for p in sorted(dest.rglob("*"))
+                if p.is_file() and not p.is_symlink()
+                and p.name != "MANIFEST.sha256"]
+
+    links = sorted(p for p in dest.rglob("*") if p.is_symlink())
     info = {
         "built_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "package": PKG_DIR,
         "target": "linux/aarch64, CPython 3.11, glibc 2.28+",
         "lean": build.get("lean", False),
-        "manifest_files": len(lines),
+        "manifest_files": len(_manifest_files()) + 1,   # +1 = build-info.json 自己
+        "symlinks": len(links),
         "extras_wheels": len(list((dest / "wheels").glob("*.whl"))),
         "mcp_wheels": len(list((dest / "mcp-wheels").glob("*.whl"))),
         "mcp_python_servers": [e["name"] for e in manifest["python"]],
@@ -471,10 +491,26 @@ def stage_pack(args: argparse.Namespace) -> int:
         "dropped_servers": build.get("dropped_servers", []),
         "key_versions": build.get("key_versions", {}),
     }
-    (dest / "build-info.json").write_text(
-        json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_info(dest, info)
     log(f"  · MCP python: {', '.join(info['mcp_python_servers']) or '(none)'}")
     log(f"  · MCP node  : {', '.join(info['mcp_node_servers']) or '(none)'}")
+
+    # ── 5) 清单 ──
+    hr("生成 MANIFEST.sha256")
+    files = _manifest_files()
+    lines = []
+    for p in files:
+        h = hashlib.sha256(p.read_bytes()).hexdigest()
+        lines.append(f"{h}  {p.relative_to(dest).as_posix()}")
+    (dest / "MANIFEST.sha256").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log(f"  ✓ {len(lines)} 个文件已登记"
+        + (f"（另有 {len(links)} 个符号链接不登记，其目标已各自入册）" if links else ""))
+    if info["manifest_files"] != len(lines):
+        # 自证：上面那个 +1 的估算必须与现实一致，否则回写修正
+        log(f"  ! build-info 写的 manifest_files={info['manifest_files']} "
+            f"与实际 {len(lines)} 不符，回写修正")
+        info["manifest_files"] = len(lines)
+        _write_info(dest, info)
 
     # ── 6) 打 tar ──
     tarball = Path(args.tarball)
