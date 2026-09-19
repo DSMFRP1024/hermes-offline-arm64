@@ -62,10 +62,16 @@ jobs:
           echo "── AST 未定义名检查 ──"
           python3 build/check_undefined.py \
               build/build_extras.py build/test_extras.py build/check_undefined.py \
-              build/test_workflow.py
+              build/test_workflow.py build/smoke_pack.py
           echo ""
           echo "── 增强包不变量 ──"
           python3 build/test_extras.py
+          echo ""
+          echo "── pack 端到端冒烟（合成最小树，秒级）──"
+          # 静态门查不出「子命令缺选项、main() 却无条件读它」这类问题：
+          # run 35413545870 里 pack 炸在 args.index 上，前面六步全绿，
+          # 白烧一轮 CI。这里把 pack 真跑一遍兜住。
+          python3 build/smoke_pack.py
           echo ""
           echo "── 工作流自检（YAML / run 块语法 / inputs 引用 / pipefail 陷阱）──"
           python3 build/test_workflow.py

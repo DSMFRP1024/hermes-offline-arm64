@@ -247,16 +247,25 @@ sudo bash <主包目录>/install.sh --force
 ## 八、构建（维护者看）
 
 ```bash
-# 本地静态门
-python3 build/check_undefined.py build/build_extras.py build/test_extras.py
-python3 build/test_extras.py
-python3 build/test_workflow.py
+# 本地静态门（都在拉镜像之前跑，秒级）
+python3 build/check_undefined.py build/build_extras.py build/test_extras.py \
+    build/check_undefined.py build/test_workflow.py build/smoke_pack.py
+python3 build/test_extras.py      # 126 项不变量（含 argparse 字段门 + 反向验证）
+python3 build/smoke_pack.py       # pack 端到端冒烟（合成最小树，不需要网络）
+python3 build/test_workflow.py    # 需要 PyYAML
 
 # 出包（GitHub Actions）
 gh workflow run build-extras.yml -f lean=false
 python3 build/gh_run.py watch    --repo <owner>/<repo> --run <RUN_ID>
+python3 build/gh_run.py arts     --repo <owner>/<repo> --run <RUN_ID>
 python3 build/gh_run.py download --repo <owner>/<repo> --artifact <ID> --out dist --parts 6
 ```
+
+`smoke_pack.py` 是**必须保留**的一道：静态分析能查「引用了不存在的名字」，
+却查不出「某个子命令少一个选项、而 `main()` 无条件读它」——这种写法
+argparse 一声不吭，直到真跑到那一步才 `AttributeError`。
+真实案例：`pack` 阶段读 `args.index`（`--index` 只挂在 `wheels` 上），
+前面六步全绿，白烧一轮十几分钟的 CI。
 
 构建分三步，缺一不可：
 
@@ -265,3 +274,27 @@ python3 build/gh_run.py download --repo <owner>/<repo> --artifact <ID> --out dis
    链接到 glibc 2.39 的轮子**，装机报 `GLIBC_2.39 not found`，而构建日志全绿。
 2. **arm64 runner 上原生 `npm install`** —— 目标机零网络，依赖树必须预装好。
 3. **打包** —— 生成 lock、MANIFEST.sha256、build-info.json，再打 tar.gz。
+
+### 触发与取构建日志（国内网络）
+
+两个和构建逻辑无关、但每次都要绊一下的点：
+
+```bash
+# ① `gh workflow run` 会先查默认分支（走 graphql），代理一抖就 502。
+#    绕开 graphql，直接调 REST 分发接口，ref 显式给：
+HTTPS_PROXY= https_proxy= HTTP_PROXY= http_proxy= \
+  gh api -X POST repos/<owner>/<repo>/actions/workflows/build-extras.yml/dispatches \
+  -f ref=main -f inputs[lean]=false
+
+# ② `gh run view --log-failed` 要连 results-receiver.actions.githubusercontent.com，
+#    那个域基本不通；`gh api .../jobs/<id>/logs` 也常因 DNS 直接失败。
+#    自己带重试拉，并且**跳转时摘掉 Authorization**（否则 Azure blob 回 401）：
+#      取日志的小脚本见本仓库 gh_run.py 的 _NoAuthOnHostChange 写法
+gh api repos/<owner>/<repo>/actions/runs/<RUN_ID>/jobs    # 先拿 job id
+gh api repos/<owner>/<repo>/actions/jobs/<JOB_ID>/logs    # 再取该 job 的原始日志
+```
+
+`HTTPS_PROXY=` 置空不是笔误：`urllib`/`gh`/`requests` 读环境变量时**跳过空值**，
+所以空串等价于「走直连」。实测沙箱代理对 github 常返 `502 Bad Gateway`，
+同一时刻直连 `api.github.com` 是 `200 / 0.7s` —— **见到成片 502 先切直连**，
+别干等。注意跨主机 302 到 `*.blob.core.windows.net` 时必须摘掉 `Authorization`。

@@ -207,6 +207,15 @@ def _pip_download(python: str, dest: Path, reqs: list[str], index: str | None) -
 
 
 def stage_wheels(args: argparse.Namespace) -> int:
+    # `--index` 的规范化只属于这个阶段：空串表示"用官方源"，而 _pip_download
+    # 是用 `if index:` 判断的，所以先归一成 None。
+    #
+    # ⚠️ 千万别把这一句提到 main() 里 —— `pack` 子命令没有 `--index` 选项，
+    # 在 main() 里写 `args.index = args.index or None` 会让 pack 直接
+    # AttributeError 崩掉（CI run 35413545870 就是这么挂的，而且前六步全绿，
+    # 只有最后一步炸，极难从"绿灯"上看出问题）。
+    args.index = args.index or None
+
     out = Path(args.out)
     wheels_dir = out / "wheels"
     mcp_dir = out / "mcp-wheels"
@@ -501,7 +510,6 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=stage_pack)
 
     args = ap.parse_args(argv)
-    args.index = args.index or None
     return args.func(args)
 
 

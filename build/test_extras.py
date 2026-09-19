@@ -28,6 +28,7 @@ import ast
 import json
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,6 +99,167 @@ def check_lf(path: Path) -> None:
           f"{path.name} 含 CRLF —— .gitattributes 要求全部 LF")
     check(data.endswith(b"\n"), f"{path.name} 以换行结尾",
           f"{path.name} 没有以换行结尾")
+
+
+# ── argparse 子命令字段一致性 ────────────────────────────────────────────
+#
+# 为什么需要这一项：`args.xxx` 在 main() 里被**无条件**访问、而某个子命令
+# 并没有定义 `--xxx` 时，argparse 一句话都不说，直到真的跑到**那个**子命令
+# 才抛 AttributeError。CI run 35413545870 就是这么挂的：静态检查、下轮子、
+# npm 安装六步全绿，只有最后的 `pack` 一步炸在
+#     args.index = args.index or None
+# （`--index` 只挂在 `wheels` 上）。
+# `check_undefined.py` 那种 AST 未定义名检查看不见「字段在不在 Namespace 上」，
+# 所以必须单独钉一条。
+
+def argparse_stages_from_src(src: str) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """静态解析 argparse 配置。
+
+    返回 (stage → 该子命令可用字段集合, stage → 处理函数名)。
+    """
+    tree = ast.parse(src)
+    parsers: dict[str, str] = {}      # 变量名 -> stage
+    dests: dict[str, set[str]] = {}
+    funcs: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "add_parser"):
+            var = node.targets[0].id
+            stage = (node.value.args[0].value
+                     if node.value.args and isinstance(node.value.args[0], ast.Constant)
+                     else var)
+            parsers[var] = stage
+            dests.setdefault(stage, set())
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if not isinstance(node.func.value, ast.Name) or node.func.value.id not in parsers:
+            continue
+        stage = parsers[node.func.value.id]
+        if node.func.attr == "add_argument":
+            # 只取第一个字符串字面量当选项名（短名/长名只记 dest）
+            for a in node.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    opt = a.value
+                    dests[stage].add(opt.lstrip("-").replace("-", "_")
+                                     if opt.startswith("-") else opt)
+                    break
+        elif node.func.attr == "set_defaults":
+            for kw in node.keywords:
+                if kw.arg:
+                    dests[stage].add(kw.arg)
+                    if kw.arg == "func" and isinstance(kw.value, ast.Name):
+                        funcs[stage] = kw.value.id
+    return dests, funcs
+
+
+def argparse_stages(path: Path) -> tuple[dict[str, set[str]], dict[str, str]]:
+    return argparse_stages_from_src(read(path))
+
+
+def args_attrs(fn: ast.AST | None, name: str = "args") -> set[str]:
+    """收集某函数体里所有 `args.<attr>` 的属性名。"""
+    if fn is None:
+        return set()
+    return {n.attr for n in ast.walk(fn)
+            if isinstance(n, ast.Attribute)
+            and isinstance(n.value, ast.Name) and n.value.id == name}
+
+
+def argparse_audit(src: str, stage_hint: Iterable[str] = ()) -> list[tuple[bool, str, str]]:
+    """返回 [(ok, 通过描述, 失败描述)]，与 check() 的入参形状一致。"""
+    out: list[tuple[bool, str, str]] = []
+    dests, funcs = argparse_stages_from_src(src)
+    stages = sorted(dests)
+    if len(stages) < 2:
+        out.append((False, "", f"解析出的子命令只有 {stages}（<2），检查器失效了"))
+        return out
+    out.append((True, f"有子命令 {stages}", ""))
+
+    fns = {n.name: n for n in ast.walk(ast.parse(src))
+           if isinstance(n, ast.FunctionDef)}
+
+    # ① main() 里的 args.* 必须每个子命令都有 —— 否则某个子命令必崩
+    common = set.intersection(*(dests[s] for s in stages))
+    missing = args_attrs(fns.get("main")) - common
+    out.append((not missing,
+                f"main() 只访问公共字段（{len(common)} 个：{sorted(common)}）",
+                f"main() 访问了不是每个子命令都有的字段：{sorted(missing)}"
+                f" —— 跑到缺这个选项的子命令就 AttributeError"))
+
+    # ② 每个阶段的处理函数只能碰自己子命令定义过的选项
+    for stage in stages:
+        fn = fns.get(funcs.get(stage, ""))
+        if fn is None:
+            continue
+        bad = args_attrs(fn) - dests[stage]
+        out.append((not bad,
+                    f"{stage} 阶段只用它自己的选项（{len(dests[stage])} 个）",
+                    f"{stage} 阶段访问了未定义选项：{sorted(bad)}"))
+
+    for hint in stage_hint:
+        out.append((hint in dests, f"有 {hint} 子命令", f"缺少 {hint} 子命令"))
+    return out
+
+
+# 门的反向验证夹具：一个「pack 没有 --index、main() 却读 args.index」的最小脚本。
+# 这段代码**故意**是坏的，只用于 self_test_argparse_gate()，不属于构建器本身。
+_FIXTURE_BUGGY = """
+import argparse
+
+
+def stage_wheels(args):
+    args.index = args.index or None
+    return args.out
+
+
+def stage_pack(args):
+    return args.src
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="stage", required=True)
+    w = sub.add_parser("wheels")
+    w.add_argument("--out", required=True)
+    w.add_argument("--index", default="")
+    w.set_defaults(func=stage_wheels)
+    p = sub.add_parser("pack")
+    p.add_argument("--src", required=True)
+    p.set_defaults(func=stage_pack)
+    args = ap.parse_args(argv)
+    args.index = args.index or None
+    return args.func(args)
+"""
+
+
+def self_test_argparse_gate() -> None:
+    """反向验证：这道门必须能抓住 bug，且对修好的版本不误报。
+
+    没有反向验证的静态门等于没写 —— 正则写歪了它照样一路绿灯。
+    """
+    bad = [d for ok, _g, d in argparse_audit(_FIXTURE_BUGGY, ("wheels", "pack"))
+           if not ok]
+    check(len(bad) == 1 and "index" in bad[0],
+          "反向验证：门能抓住「main() 读了子命令没有的字段」",
+          f"反向验证失败 —— 带 bug 的夹具没被抓住（命中 {len(bad)} 项：{bad}）")
+
+    fixed = _FIXTURE_BUGGY.replace("    args.index = args.index or None\n", "")
+    still = [d for ok, _g, d in argparse_audit(fixed, ("wheels", "pack")) if not ok]
+    check(not still,
+          "反向验证：修好后门不再报（不误报）",
+          f"反向验证失败 —— 修好的夹具仍被报错：{still}")
+
+
+def check_argparse_fields(
+        tool: Path, tool_name: str, stage_hint: Iterable[str] = ()) -> None:
+    for ok, good, bad in argparse_audit(read(tool), stage_hint):
+        check(ok, f"{tool_name} {good}", f"{tool_name} {bad}")
 
 
 # =============================================================================
@@ -355,6 +517,9 @@ def main() -> int:
         check("build/build_extras.py pack" in wf, "调用了 pack 阶段", "没有调用 pack 阶段")
         check("build/ci-extras-entry.sh" in wf, "调用了容器入口", "没有调用容器入口脚本")
         check("build/test_extras.py" in wf, "把本自检挂进了 CI", "本自检没挂进 CI")
+        check("build/smoke_pack.py" in wf,
+              "把 pack 端到端冒烟挂进了 CI",
+              "pack 冒烟没挂进 CI —— 「子命令缺选项」这类问题就只能到 CI 才暴露")
         check("chown" in wf,
               "容器跑完后 chown dist（否则 runner 写不进打包产物）",
               "没有 chown dist —— 容器以 root 落盘，后续 runner 步骤会 Permission denied")
@@ -364,7 +529,27 @@ def main() -> int:
             "\n".join(re.findall(r"^\s+run: \|\n((?:\s{10,}.*\n)+)", wf, re.M)),
             "workflow run 块")
 
-    # ── 8. 文件清单一致性 ──
+    # ── 8. 构建器 CLI：子命令字段一致性 ──
+    print("\n· build_extras.py 的 argparse 字段")
+    self_test_argparse_gate()
+    if bb.is_file():
+        try:
+            check_argparse_fields(bb, "build_extras.py", stage_hint=("wheels", "pack"))
+        except SyntaxError as exc:
+            check(False, "", f"build_extras.py 语法错误：{exc}")
+
+    sp = BUILD / "smoke_pack.py"
+    check(sp.is_file(), "build/smoke_pack.py 存在（pack 的端到端兜底）",
+          "build/smoke_pack.py 不存在 —— pack 阶段就只能靠 CI 才能验到")
+    if sp.is_file():
+        check_lf(sp)
+        try:
+            ast.parse(read(sp))
+            check(True, "smoke_pack.py 语法 OK", "")
+        except SyntaxError as exc:
+            check(False, "", f"smoke_pack.py 语法错误：{exc}")
+
+    # ── 9. 文件清单一致性 ──
     print("\n· 包内容一致性")
     if (bb.is_file()):
         src = read(bb)
