@@ -371,9 +371,18 @@ def resolve_node_entry(root: Path, pkg: str) -> tuple[Path, str]:
 
 
 def stage_pack(args: argparse.Namespace) -> int:
-    src = Path(args.src)
-    node_src = Path(args.node_src) if args.node_src else None
-    dest = Path(args.out)
+    # ⚠️ 三个根目录一律先 resolve() 成绝对路径。
+    #
+    # resolve_node_entry() 内部会 `.resolve()` 入口文件，而 CLI 传来的路径
+    # 可能是**相对**的（CI 就是 `--out dist/hermes-extras-offline-arm64`）。
+    # 绝对 / 相对一混，`path.relative_to(node_dest)` 必抛
+    # ValueError: ".../dist/mcp-node/node_modules/..../index.js' is not in the
+    # subpath of 'dist/hermes-extras-offline-arm64/mcp-node'" —— 报错文本里
+    # 一个像绝对、一个像相对，看着像"路径写错了"，其实是没归一。
+    # CI run 35415356313 就是栽在这（本地冒烟因为传的全是绝对路径而漏过）。
+    src = Path(args.src).resolve()
+    node_src = Path(args.node_src).resolve() if args.node_src else None
+    dest = Path(args.out).resolve()
 
     for req in ("wheels", "mcp-wheels", "requirements-extras.lock.txt",
                 "requirements-mcp.lock.txt", "mcp-servers.json"):
@@ -422,7 +431,13 @@ def stage_pack(args: argparse.Namespace) -> int:
             except RuntimeError as e:
                 log(f"  ✗ {entry['package']}：{e}")
                 die("Node MCP 服务器缺失 —— npm 安装步骤有问题")
-            rel = path.relative_to(node_dest).as_posix()
+            try:
+                rel = path.relative_to(node_dest).as_posix()
+            except ValueError:
+                # 入口跑到 node_dest 之外（例如 node_modules 里是符号链接，
+                # 指向仓库外的目录）。给一句人话，别把裸 ValueError 甩到日志里。
+                log(f"  ✗ {entry['package']} 的入口不在 node_modules 内：{path}")
+                die("Node MCP 入口越界 —— 检查 node_modules 是否被符号链接到别处")
             node_entries.append({**entry, "entry": rel, "version": ver})
             log(f"  ✓ {entry['name']:20s} {entry['package']}@{ver} → {rel}")
     else:

@@ -549,6 +549,37 @@ def main() -> int:
         except SyntaxError as exc:
             check(False, "", f"smoke_pack.py 语法错误：{exc}")
 
+        # 「测试必须与 CI 同形」本身也要被守住 —— bug #2 就是因为冒烟传了绝对
+        # 路径、又没给 --node-src，出错的代码路径一次都没跑到。
+        sps = read(sp)
+        check("--node-src" in sps,
+              "冒烟传了 --node-src（覆盖 Node 入口解析）",
+              "冒烟没传 --node-src —— resolve_node_entry/relative_to 那条路径"
+              "不会被跑到，CI run 35415356363 就是这么漏过去的")
+        check("build_node_fixture" in sps,
+              "冒烟造了真的 node_modules（bin 指向嵌套入口）",
+              "冒烟没造 node_modules —— Node 分支形同虚设")
+        check("relative=True" in sps and "relative=False" in sps,
+              "冒烟对「相对 / 绝对」两种传参各跑一遍",
+              "冒烟只跑一种传参 —— 绝对/相对混用这类 bug 会漏")
+        check("self_test_root_cause" in sps,
+              "冒烟内置反向验证（植回 bug 必须被抓）",
+              "冒烟没有自证 —— 「通过」可能只是没执行到那条路径")
+
+    # stage_pack 的路径归一：resolve_node_entry() 返回绝对路径，CLI 传的却
+    # 可能是相对路径，不归一就 relative_to 崩。这是 bug #2 的正面钉死。
+    if bb.is_file():
+        src = read(bb)
+        i = src.find("def stage_pack(")
+        body = src[i:i + 1400] if i >= 0 else ""
+        for expr, what in (("Path(args.src).resolve()", "--src"),
+                           ("Path(args.node_src).resolve()", "--node-src"),
+                           ("Path(args.out).resolve()", "--out")):
+            check(expr in body,
+                  f"stage_pack 把 {what} 归一成绝对路径",
+                  f"stage_pack 缺少 {expr!r} —— CLI 传相对路径时 relative_to 会崩"
+                  "（CI run 35415356313）")
+
     # ── 9. 文件清单一致性 ──
     print("\n· 包内容一致性")
     if (bb.is_file()):
