@@ -42,10 +42,13 @@ tree sha 是 (名字, 模式, 内容) 的完整函数，相等即整棵树逐字
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
+import ssl
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -58,6 +61,9 @@ UA = "hermes-offline-push/2.0"
 # 必须批量化；同时给每次调用上超时，避免无声挂死。
 GIT_TIMEOUT = 60
 HTTP_TIMEOUT = 120
+# 传输层失败（TLS 握手超时 / 连接重置 / DNS 抖动）的重试次数。
+# 见 req()：这几个接口是幂等的，重试安全。
+HTTP_RETRIES = 4
 
 
 # ---------------------------------------------------------------------------
@@ -134,24 +140,50 @@ def token() -> str:
 
 
 def req(method: str, url: str, tok: str, op, body=None, log=None):
+    """发一次 GitHub API 请求。
+
+    **传输层失败要重试**（HTTPError 不重试，那是"请求本身有问题"，要原样交给
+    调用方判断）。理由：跨境链路上 TLS 握手超时 / 连接被重置是常态，一次抖动
+    就让整轮推送白跑 —— 实测 `GET /git/ref/...` 撞上一次
+    `TimeoutError: _ssl.c:1015: The handshake operation timed out`，
+    前面准备好的整棵 tree 全废。
+
+    这里重试是安全的：用一个固定 tok，失败发生在**建连阶段**时请求根本没到服务端；
+    即便偶发"服务端处理完了但响应没回来"，Git Data API 这几个接口也是幂等的 ——
+    `POST /git/trees`、`POST /git/commits` 同样的内容必然得到同样的 sha
+    （重复创建只会留下一个内容相同的悬空对象），`PATCH /git/refs` 用同一个 sha
+    再打一次结果不变。最后还有"远端根 tree sha == 本地 HEAD^{tree}"的回读校验兜底。
+    """
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    r = urllib.request.Request(url, data=data, method=method)
-    r.add_header("Authorization", f"Bearer {tok}")
-    r.add_header("Accept", "application/vnd.github+json")
-    r.add_header("X-GitHub-Api-Version", "2022-11-28")
-    r.add_header("User-Agent", UA)
-    if data:
-        r.add_header("Content-Type", "application/json")
-    try:
-        with op.open(r, timeout=HTTP_TIMEOUT) as resp:
-            raw = resp.read().decode("utf-8")
-            return resp.status, (json.loads(raw) if raw.strip() else {})
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+    last: Exception | None = None
+    for attempt in range(1, HTTP_RETRIES + 1):
+        r = urllib.request.Request(url, data=data, method=method)
+        r.add_header("Authorization", f"Bearer {tok}")
+        r.add_header("Accept", "application/vnd.github+json")
+        r.add_header("X-GitHub-Api-Version", "2022-11-28")
+        r.add_header("User-Agent", UA)
+        if data:
+            r.add_header("Content-Type", "application/json")
         try:
-            return e.code, json.loads(raw)
-        except ValueError:
-            return e.code, {"raw": raw[:800]}
+            with op.open(r, timeout=HTTP_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8")
+                return resp.status, (json.loads(raw) if raw.strip() else {})
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, {"raw": raw[:800]}
+        except (urllib.error.URLError, ssl.SSLError, OSError,
+                http.client.HTTPException) as e:
+            last = e
+            if attempt < HTTP_RETRIES:
+                if log:
+                    log(f"  · {method} {url.split('?')[0][-60:]} 传输失败"
+                        f"（{type(e).__name__}: {e}），重试 {attempt - 1}"
+                        f"/{HTTP_RETRIES - 1}")
+                time.sleep(min(2.0 * attempt, 8.0))
+    raise RuntimeError(f"{method} {url} 连续 {HTTP_RETRIES} 次传输失败：{last}")
 
 
 # ---------------------------------------------------------------------------

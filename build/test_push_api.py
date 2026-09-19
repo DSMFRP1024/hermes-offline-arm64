@@ -24,7 +24,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import ssl
 import sys
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -39,6 +42,83 @@ def check(cond: bool, ok: str, bad: str) -> bool:
     if not cond:
         FAIL.append(bad)
     return cond
+
+
+class _Resp(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _OpFailThenOk:
+    """前 n 次抛 exc，之后返回 200。"""
+
+    def __init__(self, fail_times: int, exc: Exception):
+        self.fail_times = fail_times
+        self.exc = exc
+        self.calls = 0
+
+    def open(self, req, timeout=None):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise self.exc
+        return _Resp(b'{"ok": true}')
+
+
+class _OpHttpError:
+    def __init__(self, code: int):
+        self.code = code
+        self.calls = 0
+
+    def open(self, req, timeout=None):
+        self.calls += 1
+        raise urllib.error.HTTPError(req.full_url, self.code, "boom", {},
+                                     io.BytesIO(b'{"message":"x"}'))
+
+
+def req_retry_checks() -> None:
+    silence = lambda _m: None  # noqa: E731
+
+    op = _OpFailThenOk(2, urllib.error.URLError("Tunnel connection failed: 502"))
+    try:
+        code, body = push_api.req("GET", "https://api.github.com/x", "t", op,
+                                  log=silence)
+        check(code == 200 and body == {"ok": True} and op.calls == 3,
+              "连续 2 次 502 后第 3 次成功（共 3 次尝试）",
+              f"重试没生效：code={code} 尝试 {op.calls} 次")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "", f"抖 2 次后应成功，却抛 {type(exc).__name__}: {exc}")
+
+    op = _OpFailThenOk(1, ssl.SSLError("_ssl.c:1015: handshake timed out"))
+    try:
+        code, _ = push_api.req("GET", "https://api.github.com/x", "t", op,
+                               log=silence)
+        check(code == 200 and op.calls == 2, "SSLError 握手超时也重试",
+              f"SSLError 没被重试：尝试 {op.calls} 次")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "", f"SSLError 应被重试，却抛 {type(exc).__name__}: {exc}")
+
+    op = _OpFailThenOk(999, urllib.error.URLError("nope"))
+    try:
+        push_api.req("GET", "https://api.github.com/x", "t", op, log=silence)
+        check(False, "", "一直失败却没抛错 —— 会静默产出错误结果")
+    except RuntimeError:
+        check(op.calls == push_api.HTTP_RETRIES,
+              f"一直失败时重试 {push_api.HTTP_RETRIES} 次后抛 RuntimeError",
+              f"重试次数不对：{op.calls}（期望 {push_api.HTTP_RETRIES}）")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "", f"应抛 RuntimeError，实际 {type(exc).__name__}: {exc}")
+
+    # 4xx 是"请求本身有问题"，换通道/重试都没用，必须原样交给调用方
+    op = _OpHttpError(404)
+    code, _ = push_api.req("GET", "https://api.github.com/x", "t", op, log=silence)
+    check(code == 404 and op.calls == 1,
+          "HTTPError 404 原样返回且不重试",
+          f"4xx 被重试或吞掉：code={code} 尝试 {op.calls} 次")
 
 
 def index_shas(repo: str) -> dict[str, str]:
@@ -101,6 +181,13 @@ def main() -> int:
     check(all('"' not in p and "\\" not in p for p in idx),
           f"路径未被 core.quotePath 转义（含 {len(nonascii)} 个非 ASCII 路径）",
           "路径里出现引号或反斜杠 —— ls-files 没用 -z")
+
+    # ── req() 的传输层重试 ──
+    # 跨境链路上 TLS 握手超时/连接重置是常态，一次抖动就让整轮推送白跑：
+    # 实测直连撞上 `_ssl.c:1015 handshake timeout`，前面准备好的整棵 tree 全废
+    # （push_api 对这条 URLError 原本没有重试）。这几个断言把行为钉死。
+    print("\n· req() 传输层重试")
+    req_retry_checks()
 
     print()
     if FAIL:
