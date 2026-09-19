@@ -1,0 +1,11 @@
+{
+  "name": "hermes-extras-mcp-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Hermes 离线增强包携带的 Node 侧 MCP 服务器。目标机零网络，所以这里把依赖树整棵预装好，运行时用 node + 绝对路径直接起，不走 npx。",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "latest",
+    "@modelcontextprotocol/server-memory": "latest",
+    "@modelcontextprotocol/server-sequential-thinking": "latest"
+  }
+}

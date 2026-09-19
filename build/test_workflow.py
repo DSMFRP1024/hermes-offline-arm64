@@ -33,10 +33,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WF = ROOT / ".github" / "workflows" / "build-offline-bundle.yml"
+WFS = [
+    ROOT / ".github" / "workflows" / "build-offline-bundle.yml",
+    ROOT / ".github" / "workflows" / "build-extras.yml",
+]
 SHELLS = [ROOT / "build" / "ci-entry.sh",
+          ROOT / "build" / "ci-extras-entry.sh",
           ROOT / "target" / "install.sh",
-          ROOT / "target" / "check-env.sh"]
+          ROOT / "target" / "check-env.sh",
+          ROOT / "extras" / "install-extras.sh"]
 
 FAIL: list[str] = []
 
@@ -138,36 +143,26 @@ def lint_pipefail(script: str, where: str) -> bool:
 
 # ── 主流程 ──────────────────────────────────────────────────────────────
 
-def main() -> int:
-    print("── 工作流自检 ──")
-
-    try:
-        import yaml
-    except ImportError:
-        # 不做硬依赖：本机可能没装，先自己补一次再放弃。
-        print("  · 缺少 PyYAML，尝试自动安装...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                        "--disable-pip-version-check", "pyyaml"],
-                       capture_output=True)
-        try:
-            import yaml  # noqa: F811
-        except ImportError:
-            print("  ✗ 仍缺 PyYAML。手动装：pip install pyyaml")
-            return 2
-
-    text = WF.read_text(encoding="utf-8")
+def check_one_workflow(wf: Path, yaml) -> None:
+    """对单个工作流跑全套结构检查。"""
+    print(f"\n· {wf.relative_to(ROOT).as_posix()}")
+    if not wf.is_file():
+        check(False, "", f"{wf.relative_to(ROOT).as_posix()} 不存在")
+        return
+    text = wf.read_text(encoding="utf-8")
     # PyYAML 按 YAML 1.1 解析，裸键 `on` 会被当成布尔 True。所以两种键都要试，
     # 否则 `on: workflow_dispatch:` 会被静默读成"没有触发器"。
     doc = yaml.safe_load(text)
     trig = doc.get("on") or doc.get(True)
-    check(trig is not None, "工作流 YAML 可解析，且存在触发器", "解析不出触发器（YAML 结构错）")
+    check(trig is not None, "YAML 可解析，且存在触发器", "解析不出触发器（YAML 结构错）")
     if trig is None:
-        return 1
+        return
 
     jobs = doc.get("jobs") or {}
     check(bool(jobs), f"jobs 已声明（{', '.join(jobs)}）", "没有 jobs")
 
-    build = jobs.get("build") or {}
+    # 单 job 的工作流取那个 job；多 job 的一律要求有 build。
+    build = jobs.get("build") or next(iter(jobs.values()), {})
     runs_on = str(build.get("runs-on", ""))
     check("arm" in runs_on.lower(),
           f"runs-on = {runs_on}（含 arm，架构对）",
@@ -212,17 +207,47 @@ def main() -> int:
     check(n_run > 0, f"{n_run} 个 run 块 shell 语法与 pipefail 陷阱检查完毕",
           "workflow 里一个 run 块都没有，检查等于没跑")
 
+
+# ── 主流程 ──────────────────────────────────────────────────────────────
+
+def main() -> int:
+    print("── 工作流自检 ──")
+
+    try:
+        import yaml
+    except ImportError:
+        # 不做硬依赖：本机可能没装，先自己补一次再放弃。
+        print("  · 缺少 PyYAML，尝试自动安装...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "--disable-pip-version-check", "pyyaml"],
+                       capture_output=True)
+        try:
+            import yaml  # noqa: F811
+        except ImportError:
+            print("  ✗ 仍缺 PyYAML。手动装：pip install pyyaml")
+            return 2
+
+    any_wf = False
+    for wf in WFS:
+        if wf.is_file():
+            any_wf = True
+            check_one_workflow(wf, yaml)
+    check(any_wf, f"共 {sum(1 for w in WFS if w.is_file())} 个工作流文件已检查",
+          "一个工作流文件都没找到")
+
     # 仓库里的 shell 脚本也一起查
+    print("\n· 仓库内 shell 脚本")
+    bash = find_bash()
     for sh in SHELLS:
         if not sh.exists():
+            check(False, "", f"{sh.relative_to(ROOT).as_posix()} 不存在")
             continue
         if bash:
             p = subprocess.run([bash, "-n", str(sh)], capture_output=True,
                                text=True, encoding="utf-8", errors="replace")
-            check(p.returncode == 0, f"{sh.relative_to(ROOT)} 语法 OK",
-                  f"{sh.relative_to(ROOT)} 语法错误：{(p.stderr or '').strip()[:200]}")
+            check(p.returncode == 0, f"{sh.relative_to(ROOT).as_posix()} 语法 OK",
+                  f"{sh.relative_to(ROOT).as_posix()} 语法错误：{(p.stderr or '').strip()[:200]}")
         lint_pipefail(sh.read_text(encoding="utf-8"), sh.relative_to(ROOT).as_posix())
-
 
     print()
     if FAIL:

@@ -1,0 +1,281 @@
+name: Build Hermes Extras Bundle (ARM64)
+
+# 为什么增强包独立成一条流水线，而不是塞进 build-offline-bundle.yml：
+#
+#   主包 941 MB（Electron 桌面版 + Chromium），整条构建要几十分钟、下载要近 1 GB。
+#   增强包只多几百 MB，构建几分钟。分开之后：
+#     · 改增强包不会牵动主包，也不会让主包回归；
+#     · 可以反复重跑，拿到能用的版本再定下来；
+#     · 目标机上增强包是可选的，不想要就不装。
+#
+# 与主包一致的骨架（这两条不能省）：
+#   ubuntu-24.04-arm runner 提供**架构**，
+#   quay.io/pypa/manylinux_2_28_aarch64 容器提供 **glibc 2.28 基线**。
+#   只用 runner 会产出链接到 glibc 2.39 的轮子，拷到信创机必然
+#   `GLIBC_2.39 not found`，而且日志里完全看不出来。
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: '目标 Python 版本（必须与主包一致）'
+        required: false
+        default: '3.11'
+      node_line:
+        description: 'Node 主版本线（与主包一致）'
+        required: false
+        default: '24'
+      pypi_index:
+        description: 'PyPI 镜像 URL（留空 = 官方源）'
+        required: false
+        default: ''
+      lean:
+        description: '精简模式：跳过 opencv / scipy / jupyterlab 等重物'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'extras-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offline-extras-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+
+    steps:
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+
+      # ── 静态检查放在拉镜像之前 ──
+      # 这几项都是秒级，却能在几分钟的构建开跑之前拦下"语法合法但引用了
+      # 不存在的函数/字段"这类只有跑到后段才炸的错误。
+      - name: 静态检查（秒级）
+        run: |
+          set -euo pipefail
+          echo "── AST 未定义名检查 ──"
+          python3 build/check_undefined.py \
+              build/build_extras.py build/test_extras.py build/check_undefined.py \
+              build/test_workflow.py
+          echo ""
+          echo "── 增强包不变量 ──"
+          python3 build/test_extras.py
+          echo ""
+          echo "── 工作流自检（YAML / run 块语法 / inputs 引用 / pipefail 陷阱）──"
+          python3 build/test_workflow.py
+          echo ""
+          echo "── shell 语法 ──"
+          bash -n build/ci-extras-entry.sh
+          bash -n extras/install-extras.sh
+          python3 -c "import ast,sys; [ast.parse(open(p,encoding='utf-8').read()) for p in ['extras/verify-mcp.py','extras/merge-mcp-config.py']]"
+          echo "✓ 全部通过"
+
+      - name: 容器内下载轮子（manylinux_2_28_aarch64）
+        env:
+          PY_VERSION: ${{ github.event.inputs.python_version }}
+          PYPI_INDEX: ${{ github.event.inputs.pypi_index }}
+          LEAN_INPUT: ${{ github.event.inputs.lean }}
+        run: |
+          set -euo pipefail
+          PY_VERSION="${PY_VERSION:-3.11}"
+          # push 触发时 inputs 全是空串；boolean 的 false 也要转成空
+          [ "$LEAN_INPUT" = "true" ] && LEAN=1 || LEAN=""
+
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e PY_VERSION \
+            -e GLIBC=2.28 \
+            -e PYPI_INDEX \
+            -e LEAN \
+            quay.io/pypa/manylinux_2_28_aarch64 \
+            bash /work/build/ci-extras-entry.sh
+
+          # 容器以 root 落盘，runner 用户接下来还要往 dist/ 里写打包产物，
+          # 不 chown 会在「组装增强包」那一步报 Permission denied。
+          sudo chown -R "$(id -u):$(id -g)" dist
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ github.event.inputs.node_line || '24' }}
+
+      - name: npm 安装 Node 侧 MCP 服务器
+        run: |
+          set -euo pipefail
+          # 目标机零网络，所以这里把依赖树整棵装好、随包带走，
+          # 运行时用 node + 绝对路径直接起，不走 npx。
+          #
+          # 刻意用 arm64 runner 原生安装而不是交叉下载：这三个包虽然目前是纯 JS，
+          # 但一旦上游引入原生扩展，交叉安装会装到 x86_64 的那一份。
+          rm -rf dist/hermes-extras-mcp-node
+          mkdir -p dist/hermes-extras-mcp-node
+          cp extras/mcp-node-package.json dist/hermes-extras-mcp-node/package.json
+          cd dist/hermes-extras-mcp-node
+          npm install --omit=dev --no-audit --no-fund
+          node --version
+          npm --version
+          echo "  包数: $(ls -1 node_modules | wc -l)"
+          echo "  大小: $(du -sh node_modules | cut -f1)"
+
+      - name: 组装增强包
+        run: |
+          set -euo pipefail
+          python3 build/build_extras.py pack \
+            --src dist/hermes-extras \
+            --node-src dist/hermes-extras-mcp-node \
+            --out dist/hermes-extras-offline-arm64 \
+            --tarball dist/hermes-extras-offline-arm64.tar.gz
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          TB=dist/hermes-extras-offline-arm64.tar.gz
+          test -f "$TB" || { echo "✗ 没有产出 $TB" >&2; exit 1; }
+          test -f dist/hermes-extras-offline-arm64/build-info.json \
+            || { echo "✗ 缺少 build-info.json" >&2; exit 1; }
+          test -f dist/hermes-extras-offline-arm64/MANIFEST.sha256 \
+            || { echo "✗ 缺少 MANIFEST.sha256" >&2; exit 1; }
+
+          # 清单必须先落成文件再消费。绝不能写 `tar -tzf "$TB" | head -40`：
+          # head 读满就退出并关闭管道，tar 立刻吃 EPIPE（"tar: stdout: write error"，
+          # 退出码 2），再被 pipefail 放大成整条流水线失败 —— 包明明完好却报失败。
+          # 同理 `tar -tzf | grep -qx` 也是提前退出的消费者。
+          LIST=$(mktemp)
+          trap 'rm -f "$LIST"' EXIT
+          tar -tzf "$TB" > "$LIST"
+          N=$(wc -l < "$LIST")
+          echo "条目总数: $N"
+          sed -n '1,25p' "$LIST" | sed 's/^/  /'
+
+          musts="
+          hermes-extras-offline-arm64/install-extras.sh
+          hermes-extras-offline-arm64/verify-mcp.py
+          hermes-extras-offline-arm64/merge-mcp-config.py
+          hermes-extras-offline-arm64/README.md
+          hermes-extras-offline-arm64/MANIFEST.sha256
+          hermes-extras-offline-arm64/build-info.json
+          hermes-extras-offline-arm64/requirements-extras.lock.txt
+          hermes-extras-offline-arm64/requirements-mcp.lock.txt
+          hermes-extras-offline-arm64/mcp-servers.json
+          hermes-extras-offline-arm64/skills-official.txt
+          hermes-extras-offline-arm64/mcp-node/package.json
+          "
+          miss=0
+          for must in $musts; do
+            grep -qxF "$must" "$LIST" || { echo "✗ tar 里缺少 $must" >&2; miss=1; }
+          done
+          [ "$miss" -eq 0 ] || exit 1
+          echo "  ✓ 关键条目齐全"
+
+          # ── 轮子架构 / glibc 基线审计（第二道闸，和构建期互为印证）──
+          glibc_minor=28
+          bad=0
+          wheels_seen=0
+          while IFS= read -r w; do
+            case "$w" in
+              *.whl) ;;
+              *) continue ;;
+            esac
+            wheels_seen=$((wheels_seen + 1))
+            base="${w##*/}"
+            # 用 bash 模式匹配而不是 `printf | grep -q`：grep -q 命中即退出，
+            # 上游 printf 会吃 EPIPE，pipefail 下一样把脚本带崩。
+            if [[ "$base" == *musllinux* ]]; then
+              echo "✗ musl 轮子（glibc 机加载不了）: $base" >&2; bad=1
+            elif [[ "$base" != *_aarch64.whl && "$base" != *-none-any.whl ]]; then
+              echo "✗ 非 aarch64 的 wheel: $base" >&2; bad=1
+            fi
+            v=$(printf '%s\n' "$base" \
+                  | sed -n 's/.*manylinux_2_\([0-9][0-9]*\)_aarch64.*/\1/p' \
+                  | sort -n | tail -1)
+            if [ -n "$v" ] && [ "$v" -gt "$glibc_minor" ]; then
+              echo "✗ glibc 基线过高：manylinux_2_$v > 2.$glibc_minor  ($base)" >&2
+              bad=1
+            fi
+          done < <(grep -E '\.whl$' "$LIST" || true)
+          echo "  wheel 数: $wheels_seen"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "  ✓ wheel 全部 aarch64 / py3-none-any，且 glibc 基线不超过 2.$glibc_minor"
+
+          # ── MCP 清单必须真的对得上包里的东西 ──
+          # "清单里写了服务器、包里却没有对应文件" 是这套设计最可能的静默失败：
+          # 目标机上 config 写进去了，启动时才报连不上。
+          python3 - <<'PYEOF'
+          import json, subprocess, sys, tarfile
+          tb = "dist/hermes-extras-offline-arm64.tar.gz"
+          with tarfile.open(tb) as tf:
+              names = set(tf.getnames())
+          man = json.load(open("dist/hermes-extras-offline-arm64/mcp-servers.json",
+                               encoding="utf-8"))
+          root = "hermes-extras-offline-arm64/"
+          bad = 0
+          for e in man.get("node", []):
+              p = root + "mcp-node/" + e["entry"]
+              if p not in names:
+                  print(f"✗ mcp-servers.json 声明了 node server {e['name']}，"
+                        f"但包里没有 {p}", file=sys.stderr)
+                  bad = 1
+          if not man.get("node"):
+              print("✗ 一个 Node MCP 服务器都没有 —— npm 安装步骤没生效", file=sys.stderr)
+              bad = 1
+          if len(man.get("python", [])) < 4:
+              print(f"✗ Python 侧 MCP 服务器只剩 {len(man.get('python', []))} 个，"
+                    f"预期至少 4 个", file=sys.stderr)
+              bad = 1
+          if bad:
+              sys.exit(1)
+          print(f"  ✓ MCP 清单齐全：python {len(man.get('python', []))} 个 / "
+                f"node {len(man.get('node', []))} 个")
+          PYEOF
+
+          # ── 脚本必须有执行位（tar 里强制过 0755，这里再确认一次）──
+          tar -tvzf "$TB" > /dev/null 2>&1 || { echo "✗ tar 无法读取" >&2; exit 1; }
+
+          SHA=$(sha256sum "$TB" | awk '{print $1}')
+          SIZE=$(du -h "$TB" | cut -f1)
+          {
+            echo "## Hermes 离线增强包（ARM64）构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| tar.gz sha256 | \`$SHA\` |"
+            echo "| tar.gz 大小 | $SIZE |"
+            echo "| 条目总数 | $N |"
+            echo "| wheel 数 | $wheels_seen |"
+            echo ""
+            echo "构建信息："
+            echo '```json'
+            cat dist/hermes-extras-offline-arm64/build-info.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传增强包
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-extras-offline-arm64-tarball
+          path: dist/hermes-extras-offline-arm64.tar.gz
+          # 已经是 gzip 了，再压一遍纯属浪费时间和 CPU
+          compression-level: 0
+          retention-days: 30
+
+      - name: 发布 Release（仅打 extras-* 标签时）
+        if: startsWith(github.ref, 'refs/tags/extras-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TB=dist/hermes-extras-offline-arm64.tar.gz
+          gh release create "${GITHUB_REF_NAME}" "$TB" \
+            --title "Hermes 离线增强包 ${GITHUB_REF_NAME}" \
+            --notes "ARM64 离线增强包（办公 / 图像 / 视频 / 数据 / MCP）。校验：
+          \`\`\`
+          $(sha256sum "$TB")
+          \`\`\`
+          安装：拷到已装好主包的目标机，解压后 \`bash install-extras.sh\`" \
+            --generate-notes || true

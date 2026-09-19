@@ -1,0 +1,34 @@
+# =============================================================================
+# Hermes 离线增强包 —— MCP 服务器（Python 侧）
+# =============================================================================
+#
+# ★ 这些包**不装进 hermes 的 venv**，而是装进一个独立的 MCP venv：
+#
+#     $HERMES_HOME/mcp/venv
+#
+# 原因是实测出来的硬冲突，不是洁癖：
+#
+#     hermes 自带                mcp == 2.0.0        （[mcp] extra 钉死）
+#     fastmcp 2.14.7（office 要用） mcp < 2.0, >= 1.24.0
+#     markitdown-mcp             mcp >= 2.1.1, < 3
+#
+#   → 三者不可能共存于一个 venv。独立 venv 之后，这里的 pip 会自然收敛到
+#     mcp 1.x，而 hermes 自己的原生 MCP 客户端继续用 2.0.0，互不干扰。
+#
+# 这里 6 个 server 内部是**互相兼容**的（fastmcp 把整组拉到 mcp<2，
+# office-powerpoint 要 mcp[cli]>=1.8、sqlite 要 mcp[cli]>=1.6，都被满足），
+# 所以一个 venv 就够，不需要再拆。
+#
+# 全部无网依赖：time / git / sqlite 是本地工具，office 三个是本地文件读写。
+# 刻意不收 fetch / duckduckgo-search 这类需要外网的 server。
+# =============================================================================
+
+# ── Office 文档（本地文件读写）──
+office-powerpoint-mcp-server
+office-word-mcp-server
+excel-mcp-server
+
+# ── 官方通用（本地）──
+mcp-server-time
+mcp-server-git
+mcp-server-sqlite

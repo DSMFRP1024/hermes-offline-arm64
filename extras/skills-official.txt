@@ -1,0 +1,54 @@
+# =============================================================================
+# Hermes 离线增强包 —— 要启用的官方 optional skill
+# =============================================================================
+#
+# 上游 hermes-agent 仓库里其实自带 **151 个 optional skill**（在
+# <安装目录>/optional-skills/ 下，主包已经把它们一起打进去了），
+# 但它们**默认不激活** —— 既不在系统提示里，也不会被拷进 ~/.hermes/skills/。
+#
+# 所以这一项**不需要下载任何东西**：install-extras.sh 用
+#     hermes skills install official/<相对路径>
+# 从本地那份 optional-skills/ 里读出来装上（OptionalSkillSource 是"本地优先"，
+# 只有本地找不到才会去 GitHub 兜底）。
+#
+# 一行一个，`#` 起头是注释；你可以随意增删，删掉的就不装。
+# 全部可选项见：hermes skills browse --source official
+#
+# ⚠️ 每装一个都会进系统提示的 skills 索引。别把 151 个全装上，
+#    索引膨胀会挤占上下文。下面这 25 个是按「办公为主 + 轻度数据/编程」挑的。
+# =============================================================================
+
+# ── Office / 汇报 / 材料 ──
+official/finance/pptx-author
+official/finance/excel-author
+official/productivity/live-dashboard
+official/productivity/decision-questionnaire
+official/productivity/memento-flashcards
+official/productivity/siyuan
+official/communication/one-three-one-rule
+official/research/research-paper-writing
+official/creative/simple-english
+
+# ── 图表 / 创意 / 轻度修图 ──
+official/creative/excalidraw
+official/creative/tldraw-offline
+official/creative/concept-diagrams
+official/creative/archify
+official/creative/ai-presenter-video
+official/creative/baoyu-article-illustrator
+official/creative/meme-generation
+official/creative/pixel-art
+official/creative/sketch
+
+# ── 数据 ──
+official/data-science/jupyter-notebook
+
+# ── 编程 ──
+official/software-development/ast-grep
+official/software-development/code-wiki
+official/software-development/pr-lens
+official/software-development/rest-graphql-debug
+
+# ── 自己写 MCP / 调 MCP ──
+official/mcp/fastmcp
+official/mcp/mcporter

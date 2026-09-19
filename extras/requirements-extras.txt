@@ -1,0 +1,76 @@
+# =============================================================================
+# Hermes 离线增强包 —— 装进 **hermes 自带 venv** 的 Python 包
+# =============================================================================
+#
+# 定位：日常办公（Word / Excel / PPT / PDF / 图片 / 视频）+ 轻度数据 + 轻度编程。
+#
+# 为什么不写版本号：
+#   版本由构建时的 pip 按 **linux / aarch64 / cp311 / manylinux_2_28** 求值，
+#   结果锁进同目录的 requirements-extras.lock.txt，目标机只按 lock 装。
+#   这与主包「uv.lock → requirements.lock.txt」是同一套路。
+#   手写死版本号，只要有一个版本没发 aarch64 轮子，整条构建就挂。
+#
+# 注意：pip 的 requirements 文件里**不要写行尾注释**（只有行首 # 才保证是注释）。
+#
+# 与主包刻意的差异：
+#   · 不含 markitdown —— 上游 `read_file` 已内置 firecrawl-anydoc 自动抽取
+#     docx/xlsx/pptx/PDF，再引 markitdown 会连带拖进 onnxruntime（magika 依赖），
+#     而 onnxruntime 正是主包刻意排除的重物。功能重复，代价不小。
+#   · 不含 rembg / wand / pyvips —— 分别需要运行时下载模型、ImageMagick、libvips。
+# =============================================================================
+
+# ── Word / Excel / PPT ──
+python-docx
+docxtpl
+openpyxl
+xlsxwriter
+xlrd
+python-pptx
+odfpy
+
+# ── PDF ──
+pypdf
+reportlab
+pdfplumber
+pypdfium2
+PyMuPDF
+img2pdf
+msoffcrypto-tool
+
+# ── 中文办公零碎 ──
+python-dateutil
+pypinyin
+opencc-python-reimplemented
+segno
+qrcode
+tabulate
+
+# ── 图片（Pillow / pillow-heif 主包已带）──
+piexif
+
+# ── 视频 / 剪辑（ffmpeg 本体在 bundle/bin/ffmpeg）──
+moviepy
+imageio
+imageio-ffmpeg
+ffmpeg-python
+pysubs2
+av
+
+# ── 数据 / 图表 ──
+numpy
+pandas
+matplotlib
+plotly
+kaleido
+
+# ── 轻度编程 ──
+pytest
+ruff
+tqdm
+lxml
+html5lib
+beautifulsoup4
+markdownify
+
+# ── 配置合并需要（保留 config.yaml 的注释，PyYAML 做不到）──
+ruamel.yaml

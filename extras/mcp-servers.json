@@ -1,0 +1,73 @@
+{
+  "_comment": "MCP 服务器清单 —— install-extras.sh 只认这一份。build 阶段会把没成功打包的条目剔掉再写回包里。",
+  "python": [
+    {
+      "name": "office_pptx",
+      "package": "office-powerpoint-mcp-server",
+      "console": "ppt_mcp_server",
+      "label": "PowerPoint 读写（python-pptx）",
+      "timeout": 180
+    },
+    {
+      "name": "office_word",
+      "package": "office-word-mcp-server",
+      "console": "word_mcp_server",
+      "label": "Word 读写（python-docx）",
+      "timeout": 180
+    },
+    {
+      "name": "office_excel",
+      "package": "excel-mcp-server",
+      "console": "excel-mcp-server",
+      "label": "Excel 读写（openpyxl）",
+      "timeout": 180
+    },
+    {
+      "name": "time",
+      "package": "mcp-server-time",
+      "console": "mcp-server-time",
+      "label": "时间与时区换算",
+      "timeout": 60
+    },
+    {
+      "name": "git",
+      "package": "mcp-server-git",
+      "console": "mcp-server-git",
+      "label": "Git 仓库读写（GitPython）",
+      "timeout": 120
+    },
+    {
+      "name": "sqlite",
+      "package": "mcp-server-sqlite",
+      "console": "mcp-server-sqlite",
+      "label": "SQLite 查询与建表",
+      "timeout": 120
+    }
+  ],
+  "node": [
+    {
+      "name": "filesystem",
+      "package": "@modelcontextprotocol/server-filesystem",
+      "label": "受控目录的文件读写（限定在指定目录内）",
+      "arg_mode": "fs_roots",
+      "timeout": 120
+    },
+    {
+      "name": "memory",
+      "package": "@modelcontextprotocol/server-memory",
+      "label": "知识图谱式长期记忆（落在本地 jsonl）",
+      "arg_mode": "memory_path",
+      "env": {
+        "MEMORY_FILE_PATH": "@@MEMORY_FILE@@"
+      },
+      "timeout": 120
+    },
+    {
+      "name": "thinking",
+      "package": "@modelcontextprotocol/server-sequential-thinking",
+      "label": "结构化分步推理",
+      "arg_mode": "none",
+      "timeout": 120
+    }
+  ]
+}
